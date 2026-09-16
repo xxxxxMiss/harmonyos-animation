@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------------------
+# macOS
+# ---------------------------------------------------------------------------
+.DS_Store
+
+# ---------------------------------------------------------------------------
+# Signing material and credentials — NEVER commit these
+#
+# GlowLemniscate/build-profile.json5 is excluded because DevEco Studio writes
+# the signing configuration into it: encrypted keyPassword / storePassword
+# values plus absolute paths to this machine's ~/.ohos/config keystore. It is
+# both a credential and machine-specific, so it cannot be shared anyway.
+#
+# On a fresh clone: copy build-profile.example.json5 to build-profile.json5 and
+# let DevEco Studio's automatic signing fill in the material.
+# ---------------------------------------------------------------------------
+GlowLemniscate/build-profile.json5
+*.p12
+*.p7b
+*.cer
+*.csr
+
+# ---------------------------------------------------------------------------
+# HarmonyOS build output and caches
+# ---------------------------------------------------------------------------
+GlowLemniscate/.hvigor/
+GlowLemniscate/.idea/
+GlowLemniscate/build/
+GlowLemniscate/entry/build/
+GlowLemniscate/oh_modules/
+GlowLemniscate/**/oh_modules/
+GlowLemniscate/**/node_modules/
+GlowLemniscate/local.properties
+GlowLemniscate/.clangd
+GlowLemniscate/.clang-format
+*.hap
+*.hsp
+
+# ---------------------------------------------------------------------------
+# Relocated hvigor home
+#
+# The build is invoked with HVIGOR_USER_HOME pointing here instead of ~/.hvigor,
+# so the toolchain cache stays inside the workspace. Pure cache, ~15 MB.
+# ---------------------------------------------------------------------------
+.hvigor-home/
+
+# ---------------------------------------------------------------------------
+# Downloaded documentation cache
+#
+# research/raw/ holds ~100 cached copies of third-party OpenHarmony / Huawei doc
+# pages (3 MB) that back the citations in research/*.md. The reports carry the
+# source URLs, so the cache itself does not need to be versioned.
+# ---------------------------------------------------------------------------
+research/raw/
+
+# ---------------------------------------------------------------------------
+# Scratch
+# ---------------------------------------------------------------------------
+*.log
+*.tmp

@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Glow Lemniscate — ArkTS renderer twin</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; left: 10px; top: 10px; color: #7a7a8c;
+    font: 11px/1.55 ui-monospace, Menlo, monospace; pointer-events: none;
+    white-space: pre; text-shadow: 0 0 4px #000;
+  }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="hud"></div>
+<script>
+"use strict";
+/*
+ * HTML twin of the HarmonyOS ArkTS renderer in GlowLemniscate/entry/src/main/ets/glow/.
+ *
+ * Both this file and the ArkTS code drive Skia with the same primitive set:
+ *   stroke(path) + additive compositing ("lighter" / drawing.BlendMode.PLUS).
+ * Chrome rasterises with Skia, and HarmonyOS `drawing` is Skia-backed too, so
+ * numbers tuned here carry over to the ArkTS renderer.
+ *
+ * Glow model
+ * ----------
+ * The shader computes, per pixel:
+ *     col += 10 * smoothstep(0.003, 0.001, dist)      // white core
+ *     col += pow(radius/dist, 0.9) * glowColour       // coloured halo
+ *     col  = 1 - exp(-col)                            // tone map
+ *
+ * There is no fragment shader available through the drawing API, so the halo is
+ * rebuilt from vector primitives. The trick: stroking a path with width w covers
+ * EXACTLY the set of points within w/2 of the path — a stroke is a distance
+ * field. So N nested strokes of decreasing width approximate any radial falloff:
+ *
+ *     value(d) = SUM of alphas of every stroke with width/2 > d
+ *
+ * Choosing the alphas as successive differences of the tone-mapped target
+ * profile therefore reproduces pow(R/d, 0.9) far more faithfully than a Gaussian
+ * blur, whose tail is much too short, and costs no blur pass at all.
+ *
+ * URL params:
+ *   ?t=1.234     freeze at shader time t   (otherwise animate)
+ *   ?w=900&h=700 viewport size
+ *   ?q=2         device pixel ratio
+ *   ?n=20        number of glow rings      (?n=0 -> use the blurred fallback)
+ *   ?spike=1     reproduce the original's degenerate first Bezier segment
+ */
+
+// ---------------------------------------------------------------------------
+// Constants — 1:1 with the GLSL in the original script.js
+// ---------------------------------------------------------------------------
+const POINT_COUNT   = 8;        // #define POINT_COUNT 8
+const SEG_LEN       = 0.25;     // const float len = 0.25
+const SPEED         = -0.7;     // const float speed = -0.7
+const PHASE_PERIOD  = 6.28;     // shader literal: fract(speed * t) * 6.28
+const SHAPE_SCALE   = 0.000015; // float scale = 0.000015 * height
+const GLOW_RADIUS   = 0.02;     // float radius = 0.02 (pos-space units)
+const TIME_STEP     = 0.015;    // var dt = 0.015
+const GLOW_EXP      = 0.9;      // float intensity = 0.9
+
+const TRAILS = [
+  { offset: 0.0, glow: [0.7, 0.3, 0.9] },   // vec3(0.7, 0.3, 0.9) — purple
+  { offset: 3.7, glow: [0.3, 0.5, 0.9] }    // vec3(0.3, 0.5, 0.9) — blue
+];
+
+// Ring profile bounds, in units of the glow radius R (= 0.02 * width px).
+const D_MAX = 6.0;    // outermost ring radius
+const D_MIN = 0.05;   // innermost ring radius
+
+// Bounding box of the lemniscate in curve units (numerically measured, 2M samples).
+const LEMNISCATE_MAX_X = 22.906480;
+const LEMNISCATE_MAX_Y = 9.540147;
+// Fraction of the viewport the figure may occupy when fitting.
+const FIT_MARGIN = 0.90;
+
+// ---------------------------------------------------------------------------
+// Curve math — ports of getLemniscatePosition() / getSegment()
+// ---------------------------------------------------------------------------
+function fract(x) { return x - Math.floor(x); }
+
+function lemniscate(t, out) {
+  const a = (1.0 + 0.5 + 0.5 * Math.sin(t)) * 15.0;
+  const s = Math.sin(t);
+  const c = Math.cos(t);
+  const d = 1.0 + s * s;
+  out.x = (a * c) / d;
+  out.y = (a * s * c) / d;
+}
+
+/**
+ *   uv  = gl_FragCoord.xy / resolution.xy            (y up)
+ *   pos = vec2(0.5) - uv;  pos.y /= (resolution.x / resolution.y)
+ *
+ * A curve point S in pos-space lands on the canvas at
+ *   x = W * (0.5 - S.x)        <- note the X mirror
+ *   y = H * 0.5 + W * S.y
+ * One pos-space unit equals W device-independent pixels on BOTH axes, so the
+ * shader's glow radius converts to pixels simply as GLOW_RADIUS * W.
+ *
+ * Framing note — the original shader is NOT resolution independent. The figure's
+ * on-screen half-width is  W * scale * MAX_X = 0.000015 * W * H * 22.906, while
+ * the screen's own half-width is W/2, so the overflow ratio collapses to
+ *
+ *     halfWidth / (W/2) = 2 * 0.000015 * MAX_X * H = 6.8719e-4 * H
+ *
+ * — a function of the viewport HEIGHT alone. It only fits while H < ~1455 px, so
+ * every modern phone overflows in portrait (1260x2720 -> 1.87x) and fits in
+ * landscape (2720x1260 -> 0.87x). `fit` clamps the scale so the figure always
+ * fits; `devH` lets a small preview canvas simulate a tall device faithfully.
+ */
+function makeViewport(w, h, fit, devH) {
+  const refH = devH || h;
+  const shaderScale = SHAPE_SCALE * refH;
+  let scale = shaderScale;
+  if (fit) {
+    const fitX = FIT_MARGIN * 0.5 / LEMNISCATE_MAX_X;
+    const fitY = FIT_MARGIN * 0.5 * h / (w * LEMNISCATE_MAX_Y);
+    scale = Math.min(shaderScale, fitX, fitY);
+  }
+  return {
+    w, h, scale, refH,
+    overflow: 2 * scale * LEMNISCATE_MAX_X,   // 1.0 == exactly fills the width
+    mapX: (cx) => w * (0.5 - scale * cx),
+    mapY: (cy) => h * 0.5 + w * (scale * cy),
+    glowRadiusPx: GLOW_RADIUS * w
+  };
+}
+
+/**
+ * The quadratic-Bezier chain walked by getSegment():
+ *   mid(0,1) ->[ctrl P1]-> mid(1,2) -> ... ->[ctrl P6]-> mid(6,7)
+ * `includeSpike` re-adds the original's degenerate i = 0 segment
+ * (sdBezier(mid01, P0, mid01)), which shows up as a sharp kink.
+ */
+function buildTrail(spec, time, vp, includeSpike) {
+  const phase = spec.offset + fract(SPEED * time) * PHASE_PERIOD;
+  const P = [];
+  for (let i = 0; i < POINT_COUNT; i++) {
+    const p = { x: 0, y: 0 };
+    lemniscate(phase + i * SEG_LEN, p);
+    P.push(p);
+  }
+  const M = [];
+  for (let i = 0; i < POINT_COUNT - 1; i++) {
+    M.push({ x: (P[i].x + P[i + 1].x) / 2, y: (P[i].y + P[i + 1].y) / 2 });
+  }
+  const start = { x: vp.mapX(M[0].x), y: vp.mapY(M[0].y) };
+  const segs = [];
+  for (let i = 1; i <= POINT_COUNT - 2; i++) {
+    segs.push({
+      c: { x: vp.mapX(P[i].x), y: vp.mapY(P[i].y) },
+      e: { x: vp.mapX(M[i].x), y: vp.mapY(M[i].y) }
+    });
+  }
+  const spike = includeSpike
+    ? { c: { x: vp.mapX(P[0].x), y: vp.mapY(P[0].y) }, e: start }
+    : null;
+  return { start, segs, spike, glow: spec.glow };
+}
+
+function tracePath(ctx, trail) {
+  ctx.beginPath();
+  ctx.moveTo(trail.start.x, trail.start.y);
+  for (const s of trail.segs) ctx.quadraticCurveTo(s.c.x, s.c.y, s.e.x, s.e.y);
+  if (trail.spike) {
+    ctx.moveTo(trail.start.x, trail.start.y);
+    ctx.quadraticCurveTo(trail.spike.c.x, trail.spike.c.y, trail.spike.e.x, trail.spike.e.y);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Glow pass tables
+// ---------------------------------------------------------------------------
+
+/** Tone-mapped target profile of the shader's halo term: 1 - exp(-(R/d)^0.9). */
+function targetProfile(dOverR) {
+  if (dOverR <= 0) return 1;
+  return 1 - Math.exp(-Math.pow(1 / dOverR, GLOW_EXP));
+}
+
+/**
+ * Builds the ring table: N nested strokes whose cumulative alpha reproduces
+ * `targetProfile`. Radii are geometric so the steps look uniform to the eye.
+ * Returns widths in units of R, plus the per-ring alpha.
+ */
+function buildRings(n) {
+  const radii = [];                                  // descending
+  for (let k = 0; k < n; k++) {
+    const u = n === 1 ? 0 : k / (n - 1);
+    radii.push(D_MAX * Math.pow(D_MIN / D_MAX, u));
+  }
+  const rings = [];
+  let prev = 0;                                      // T(infinity) = 0
+  for (let k = 0; k < n; k++) {
+    const cur = targetProfile(radii[k]);
+    rings.push({ radius: radii[k], alpha: cur - prev });
+    prev = cur;
+  }
+  return rings;
+}
+
+/**
+ * Glow pass table — "wide blurred bands".
+ *
+ * A stroke of width w blurred with sigma s covers d < w/2 solidly (at `alpha`)
+ * and then falls off as a Gaussian skirt reaching ~2 sigma past the edge.
+ * Chaining a few such bands with geometrically growing width and shrinking
+ * alpha therefore builds the long tail of pow(R/d, 0.9) with perfectly smooth
+ * transitions — unlike a ring staircase, which bands visibly at any affordable
+ * ring count.
+ *
+ * Fitted against the tone-mapped target T(d) = 1 - exp(-(R/d)^0.9):
+ *    d/R    0    1     2     3     6    11
+ *    T     1.0  0.60  0.39  0.30  0.19  0.11
+ * which the three bands below reproduce as 0.90 / 0.57 / 0.30 / 0.135 / 0.12.
+ *
+ * `width` and `sigma` are multiples of R; `sigma` maps 1:1 onto the CSS/Canvas
+ * blur radius and onto MaskFilter's sigma.
+ */
+const BANDS = [
+  { w: 1.6,  sigma: 0.8, alpha: 1.000 },  // inner   -> rolls off to ~2.4R
+  { w: 2.7,  sigma: 1.7, alpha: 0.077 },  //         -> rolls off to ~6R
+  { w: 4.8,  sigma: 3.0, alpha: 0.319 },  //         -> rolls off to ~11R
+  { w: 12.8, sigma: 8.0, alpha: 0.325 }   // ambient -> rolls off to ~22R
+];
+
+/**
+ * shader: 10 * smoothstep(0.003, 0.001, dist). The white term saturates out to
+ * dist ~ 0.0026 pos-units, and 1 pos-unit = W px, so the core width is a
+ * FRACTION OF CANVAS WIDTH (~0.0052 * W), never a fixed pixel count.
+ * Two strokes give the soft shoulder that smoothstep has.
+ */
+const CORE_INNER_FACTOR = 0.0035;
+const CORE_HALO_FACTOR  = 0.0075;
+const CORE_HALO_ALPHA   = 0.45;
+
+/*
+ * Tone-map compensation. The shader's final `col = 1 - exp(-col)` is a SOFT
+ * clipper: the coloured glow is 5-25x over unity near the line, so tone mapping
+ * lifts even the low (green) channel and the neighbourhood reads as near-white.
+ * `lighter`/BlendMode.PLUS clamps at 1.0 instead - a HARD clipper - so without
+ * this extra soft white band the port stays saturated purple right up to the
+ * core and the line looks thin and flat.
+ * WIDTH/SIGMA are multiples of the glow radius R.
+ */
+const LIFT_WIDTH = 0.70;
+const LIFT_SIGMA = 0.20;
+const LIFT_ALPHA = 0.55;
+
+// ---------------------------------------------------------------------------
+// Renderer — mirrors GlowRenderer.render() in ArkTS
+//   canvas.drawColor(BLACK, BlendMode.SRC)          -> fillRect + 'source-over'
+//   pen.setMaskFilter(createBlurMaskFilter(..))     -> ctx.filter = 'blur(Npx)'
+//   pen.setBlendMode(drawing.BlendMode.PLUS)        -> 'lighter'
+// ---------------------------------------------------------------------------
+function render(ctx, vp, time, opts) {
+  const R = vp.glowRadiusPx;
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.filter = 'none';
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, vp.w, vp.h);
+
+  const trails = TRAILS.map((s) => buildTrail(s, time, vp, opts.spike));
+
+  const drawHalo = opts.layers !== 'core';
+  const drawCore = opts.layers !== 'halo';
+
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  if (!drawHalo) {
+    // core-only view: skip straight to the white strokes
+  } else if (opts.rings > 0) {
+    // --- distance-field ring stack: no blur, exact-ish pow(R/d, 0.9) --------
+    for (let k = opts.rings - 1; k >= 0; k--) {           // widest first
+      const ring = opts.ringTable[k];
+      ctx.globalAlpha = ring.alpha;
+      ctx.lineWidth = 2 * ring.radius * R;
+      for (const tr of trails) {
+        ctx.strokeStyle = `rgb(${Math.round(tr.glow[0] * 255)},${Math.round(tr.glow[1] * 255)},${Math.round(tr.glow[2] * 255)})`;
+        tracePath(ctx, tr);
+        ctx.stroke();
+      }
+    }
+  } else {
+    // --- wide blurred bands -------------------------------------------------
+    for (const band of BANDS) {
+      ctx.filter = band.sigma <= 0 ? 'none' : `blur(${(R * band.sigma).toFixed(2)}px)`;
+      ctx.globalAlpha = band.alpha;
+      ctx.lineWidth = band.w * R;
+      for (const tr of trails) {
+        ctx.strokeStyle = `rgb(${Math.round(tr.glow[0] * 255)},${Math.round(tr.glow[1] * 255)},${Math.round(tr.glow[2] * 255)})`;
+        tracePath(ctx, tr);
+        ctx.stroke();
+      }
+    }
+    ctx.filter = 'none';
+  }
+
+  // --- additive white: tone-map lift -> shoulder -> solid core --------------
+  if (!drawCore) { ctx.globalCompositeOperation = 'source-over'; return; }
+  ctx.strokeStyle = '#fff';
+
+  ctx.globalAlpha = LIFT_ALPHA;
+  ctx.lineWidth = LIFT_WIDTH * R;
+  ctx.filter = `blur(${(LIFT_SIGMA * R).toFixed(2)}px)`;
+  for (const tr of trails) { tracePath(ctx, tr); ctx.stroke(); }
+  ctx.filter = 'none';
+
+  ctx.globalAlpha = CORE_HALO_ALPHA;
+  ctx.lineWidth = CORE_HALO_FACTOR * vp.w;
+  for (const tr of trails) { tracePath(ctx, tr); ctx.stroke(); }
+
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = CORE_INNER_FACTOR * vp.w;
+  for (const tr of trails) { tracePath(ctx, tr); ctx.stroke(); }
+
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// ---------------------------------------------------------------------------
+// Driver
+// ---------------------------------------------------------------------------
+const params = new URLSearchParams(location.search);
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const hud = document.getElementById('hud');
+
+const vpW = Number(params.get('w') || 900);
+const vpH = Number(params.get('h') || 700);
+const dpr = Number(params.get('q') || 1);
+const freeze = params.has('t') ? Number(params.get('t')) : null;
+const spike = params.get('spike') === '1';
+const nRings = params.has('n') ? Number(params.get('n')) : 0;
+const ringTable = buildRings(Math.max(0, nRings));
+// `fit=0` reproduces the original shader framing; `fit=1` (default) clamps it so
+// the whole figure is visible. `devH` is the real device height in px, so a small
+// preview canvas can reproduce a tall phone's framing exactly.
+const fit = params.get('fit') !== '0';
+// 'both' (default) | 'halo' (coloured bands only) | 'core' (white strokes only)
+const layers = params.get('layers') || 'both';
+const devH = params.has('devH') ? Number(params.get('devH')) : 0;
+const orientation = params.get('label') || '';
+
+cv.width = Math.round(vpW * dpr);
+cv.height = Math.round(vpH * dpr);
+cv.style.width = vpW + 'px';
+cv.style.height = vpH + 'px';
+ctx.scale(dpr, dpr);
+
+const vp = makeViewport(vpW, vpH, fit, devH);
+const opts = { spike, rings: Math.max(0, nRings), ringTable, layers };
+
+let time = 0;
+let frames = 0;
+let fpsT = performance.now();
+let fps = 0;
+let ms = 0;
+
+function hudText(t) {
+  return (orientation ? orientation + '\n' : '') +
+    `canvas  = ${vpW}x${vpH} @${dpr}x${devH ? '  (device H=' + devH + ')' : ''}\n` +
+    `scale   = ${vp.scale.toFixed(5)}   fit=${fit ? 'on' : 'off'}\n` +
+    `figure  = ${(vp.overflow * 100).toFixed(0)}% of viewport width` +
+    `${vp.overflow > 1 ? '   <<< CLIPPED' : ''}\n` +
+    `R       = ${vp.glowRadiusPx.toFixed(1)} px\n` +
+    `rings   = ${opts.rings}${opts.rings ? '' : ' (blur bands)'}\n` +
+    `layers  = ${opts.layers}\n` +
+    `time    = ${t.toFixed(3)}\n` +
+    (freeze === null ? `render  = ${ms.toFixed(2)} ms\nfps     = ${fps}` : '');
+}
+
+function frame() {
+  if (freeze === null) time += TIME_STEP;
+  const t0 = performance.now();
+  render(ctx, vp, freeze === null ? time : freeze, opts);
+  ms = ms * 0.9 + (performance.now() - t0) * 0.1;
+
+  frames++;
+  const now = performance.now();
+  if (now - fpsT > 500) {
+    fps = Math.round((frames * 1000) / (now - fpsT));
+    frames = 0; fpsT = now;
+    hud.textContent = hudText(freeze === null ? time : freeze);
+  }
+  if (freeze === null) requestAnimationFrame(frame);
+}
+
+frame();
+if (freeze !== null) {
+  hud.textContent = hudText(freeze);
+  document.title = 'frame ' + freeze;
+}
+</script>
+</body>
+</html>

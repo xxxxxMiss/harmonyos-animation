@@ -1,0 +1,61 @@
+/*
+ * build-profile.example.json5
+ *
+ * Template for the project-level build configuration.
+ *
+ * `build-profile.json5` is intentionally NOT committed — see .gitignore. DevEco
+ * Studio writes the signing material into it (encrypted keyPassword /
+ * storePassword plus absolute paths into ~/.ohos/config), which is both a
+ * credential and specific to one machine, so it cannot be shared through git.
+ *
+ * To build a fresh clone:
+ *
+ *   1. cp build-profile.example.json5 build-profile.json5
+ *   2. Open the project in DevEco Studio.
+ *   3. File -> Project Structure -> Signing Configs -> tick "Automatically
+ *      generate signature". DevEco fills in `signingConfigs` for you.
+ *
+ * Without step 3 the project still compiles; it just produces an unsigned HAP
+ * that cannot be installed on a device.
+ *
+ * Note that `compatibleSdkVersion` is pinned to 5.0.0(12): everything the app
+ * uses is API 12, and the list page relies on `Repeat` + virtualScroll needing
+ * the V2 state decorators, which are API 12 as well.
+ */
+{
+  "app": {
+    // Empty on purpose. DevEco Studio's automatic signing repopulates this.
+    "signingConfigs": [],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compatibleSdkVersion": "5.0.0(12)",
+        "targetSdkVersion": "5.0.0(12)",
+        "runtimeOS": "HarmonyOS"
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug",
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

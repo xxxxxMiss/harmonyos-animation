@@ -1,0 +1,69 @@
+{
+  "module": {
+    "name": "entry",
+    "type": "entry",
+    "description": "$string:module_desc",
+    "mainElement": "EntryAbility",
+    "deviceTypes": [
+      "phone",
+      "tablet",
+      "2in1",
+      "wearable"
+    ],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "pages": "$profile:main_pages",
+    "abilities": [
+      {
+        "name": "EntryAbility",
+        "srcEntry": "./ets/entryability/EntryAbility.ets",
+        "description": "$string:EntryAbility_desc",
+        "icon": "$media:layered_image",
+        "label": "$string:EntryAbility_label",
+        "startWindowIcon": "$media:startIcon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true,
+        /*
+         * 横竖屏配置。
+         *
+         * 这个特效的图形是 2.40 : 1 的扁长双纽线，而它在屏幕上的像素尺寸只取决于
+         * W * H，与宽高比无关 —— 竖屏 1260x2720 会渲染出和横屏 2720x1260 一样宽的
+         * 2356px 图形，但竖屏只有 1260px 宽可看，横向溢出 1.87 倍，只能看到中间一段。
+         *
+         * "auto_rotation" 允许 竖屏 / 横屏 / 横屏反向 / 竖屏反向 四种朝向，
+         * 设备旋转时窗口自动重构，Index.ets 会重新测量画布尺寸并重投影。
+         *
+         * 其他可选值：
+         *   "auto_rotation_landscape" —— 锁定横屏两种朝向，跟随系统旋转锁定
+         *   "landscape"               —— 只允许横屏正向，不受系统旋转锁定影响
+         *   "portrait"                —— 只允许竖屏（默认值，图形会被裁掉）
+         */
+        "orientation": "auto_rotation",
+        "skills": [
+          {
+            "entities": [
+              "entity.system.home"
+            ],
+            "actions": [
+              "action.system.home"
+            ]
+          }
+        ]
+      }
+    ],
+    "extensionAbilities": [
+      {
+        "name": "EntryBackupAbility",
+        "srcEntry": "./ets/entrybackupability/EntryBackupAbility.ets",
+        "type": "backup",
+        "exported": false,
+        "metadata": [
+          {
+            "name": "ohos.extension.backup",
+            "resource": "$profile:backup_config"
+          }
+        ],
+      }
+    ]
+  }
+}

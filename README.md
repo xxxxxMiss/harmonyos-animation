@@ -136,12 +136,36 @@ node tools/verify-geometry.mjs
 
 首页右上角「列表 Demo」按钮进入 `pages/ListPage`（独立路由）。
 
-- `List` + `Repeat(..).virtualScroll(..)`
-- 顶部下拉 → 上方插入 20 条；滑到底部 → 下方追加 20 条
-- 条目高度各不相同，且部分条目延迟 240~660ms 才撑开（乱序落位）
-- **每次布局变化后把视口顶部那一行放回原位**，所以加载和慢条目落位都不会让位置跑掉
+**滚动效果是通用组件，和业务无关，全部可配置** —— `entry/src/main/ets/scroll/AnchoredPaging.ets`。
+它不持有数据、不认识你的类型、不发起请求；只在你该加载的时候发信号：
 
-机制、边界处理与验证方法见 **[`docs/LIST-SCROLL-ANCHOR.md`](docs/LIST-SCROLL-ANCHOR.md)**。
+```ts
+private paging = new AnchoredPaging({
+  prefetchRows: 2,       // 距末尾几行要下一页
+  pullThresholdVp: 80,   // 触顶后下拉多少 vp，松手才算请求
+  pullSteps: 10,         // 指示器进度格数
+  anchor: { toleranceVp: 1.0, maxCorrections: 40, stallLimit: 3 }
+});
+
+this.paging.onRequestOlder = () => { this.loadOlder(); };   // 你原有的逻辑
+this.paging.onRequestNewer = () => { this.loadNewer(); };
+
+this.paging.insertAnchored(page.length, () => {             // 包住「改数据」这一步
+  this.items = page.concat(this.items);                     // 数组是你的
+});
+```
+
+接线只有六个滚动回调（`onScrollIndex` / `onScrollStart` / `onScrollStop` /
+`onReachStart` / `onScrollFrameBegin` + 行上的 `onAreaChange`），**没有任何手势**。
+
+| 属于效果的参数 | 属于你的业务 |
+|---|---|
+| `prefetchRows`、`pullThresholdVp`、`pullSteps`、`anchor.*` | `pageSize`、数据源、加载状态位、空态/错误态 |
+
+**判据：「滚动该怎么反应」是效果的；「数据从哪来、一次要多少」是你的。**
+
+`ListPage.ets` 现在只是演示宿主，只剩「行长什么样 / 数据从哪来 / 一页多少条」。
+接入方式、机制、真机踩坑见 **[`docs/LIST-SCROLL-ANCHOR.md`](docs/LIST-SCROLL-ANCHOR.md)**。
 
 ## 7. 代码结构
 
@@ -150,8 +174,9 @@ node tools/verify-geometry.mjs
 | `entry/src/main/ets/glow/GlowCurve.ets` | shader 几何的纯函数移植。无 ArkUI 依赖，常量与 GLSL 一一对应，逐行注释标了出处 |
 | `entry/src/main/ets/glow/GlowRenderer.ets` | `drawing` API 渲染器。两种辉光模式：`BLUR`（默认，宽模糊带）/ `RINGS`（距离场环形） |
 | `entry/src/main/ets/pages/Index.ets` | 首页：`Canvas(DrawingRenderingContext)` + `displaySync` 主循环，右上角有进入列表 Demo 的按钮 |
-| `entry/src/main/ets/pages/ListPage.ets` | 长列表路由页：`List` + `Repeat` 虚拟滚动、下拉分页、滚动锚定 |
-| `entry/src/main/ets/scroll/AnchorKeeper.ets` | 滚动锚定器：记录视口首行位置，在每次布局变化后放回原位 |
+| `entry/src/main/ets/pages/ListPage.ets` | 长列表路由页：**只是演示宿主**，只含业务（行样式 / 数据源 / 页大小） |
+| `entry/src/main/ets/scroll/AnchoredPaging.ets` | **通用滚动效果**：业务无关、全部可配置。分页触发 + 位置保持 |
+| `entry/src/main/ets/scroll/AnchorKeeper.ets` | 底层锚定原语（被 `AnchoredPaging` 使用），阈值经 `AnchorOptions` 注入 |
 | `entry/src/main/ets/model/FeedItem.ets` | 列表数据模型，含变高条目与"慢速渲染"模拟 |
 
 想换辉光模式：

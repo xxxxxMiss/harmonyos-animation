@@ -62,9 +62,19 @@ $HDC shell snapshot_display -f /data/local/tmp/x.jpeg && $HDC file recv /data/lo
 
 排查问题时 `hilog` 里的 `AnchorKeeper` / `ListPage` tag 是最直接的证据来源。
 
-## 3. 列表页的三条硬约束（不要回退）
+## 3. 滚动效果是通用组件，不要把它写回业务里
 
-`entry/src/main/ets/pages/ListPage.ets` 与 `scroll/AnchorKeeper.ets`：
+- **`scroll/AnchoredPaging.ets` —— 通用效果，业务无关，全部可配置。**
+  它不认识任何数据类型、不持有数组、不发起请求；只发 `onRequestOlder` /
+  `onRequestNewer` 两个信号，并让宿主用 `insertAnchored(n, mutate)` 包住「改数据」这一步。
+- **`scroll/AnchorKeeper.ets` —— 底层锚定原语**（`AnchoredPaging` 内部用它）。
+  阈值/预算通过 `AnchorOptions` 注入，模块级常量已经清掉。
+- **`pages/ListPage.ets` —— 只是演示宿主**，只该出现业务（行长什么样、数据从哪来、
+  一页多少条）。往它里面加滚动逻辑就等于把通用组件又写死回去了。
+
+判据：**「滚动该怎么反应」属于效果；「数据从哪来、一次要多少」属于宿主。**
+
+### 三条硬约束（不要回退）
 
 1. **全量 V2 状态管理** —— `@ComponentV2` / `@Local` / `@Param` / `@ObservedV2` / `@Trace`。
    V1 与 V2 组件不能混在一棵树里。`Repeat(...).virtualScroll(...)` **必须**在 V2 下才工作，
@@ -86,10 +96,10 @@ $HDC shell snapshot_display -f /data/local/tmp/x.jpeg && $HDC file recv /data/lo
 ```
 REPORT.md                      特效移植的调研正文（原理、方案对比、真机结论）
 README.md                      快速上手 / 编译 / 调参速查
-docs/LIST-SCROLL-ANCHOR.md     长列表分页与滚动锚定：机制、踩坑、验证状态
+docs/LIST-SCROLL-ANCHOR.md     长列表分页与滚动锚定：接入方式、机制、踩坑、验证状态
 GlowLemniscate/                可编译工程（ArkTS，API 12 基线）
   entry/src/main/ets/glow/       shader 几何移植 + drawing API 渲染器
-  entry/src/main/ets/scroll/     AnchorKeeper：滚动锚定器
+  entry/src/main/ets/scroll/     AnchoredPaging：通用滚动效果；AnchorKeeper：底层锚定原语
   entry/src/main/ets/model/      FeedItem：列表数据与异步内容模拟
   entry/src/main/ets/pages/      Index（发光页）/ ListPage（长列表）
 tools/verify-geometry.mjs      纯 Node 的几何正确性验证

@@ -82,7 +82,7 @@
  *   - the page calls `release()` (the user took over the scroll), or
  *   - a new `capture()`/`begin()` supersedes it, or
  *   - the target row never becomes measurable (`STALL_LIMIT`), or
- *   - the per-hold correction budget (`MAX_CORRECTIONS`) trips.
+ *   - the per-hold correction budget (`anchor.maxCorrections`) trips.
  * Holding itself costs nothing: with no events arriving, no work happens.
  */
 
@@ -92,14 +92,29 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 const DOMAIN: number = 0x0000;
 const TAG: string = 'AnchorKeeper';
 
-/** Consider the position restored once the row is this close to where it was. */
-const TOLERANCE_VP: number = 1.0;
+/**
+ * Tunables for the anchoring itself.
+ *
+ * These are injected rather than fixed, so the effect can be dropped into a
+ * project that already has its own ideas about tolerances and budgets. Every
+ * field has a default that works for a general-purpose list.
+ */
+export interface AnchorOptions {
+  /** The position counts as restored once the row is within this many vp. */
+  toleranceVp?: number;
+  /** Consecutive unmeasurable samples before giving up on the target row. */
+  stallLimit?: number;
+  /** Hard cap on corrections for one hold, so a pathological layout cannot spin. */
+  maxCorrections?: number;
+}
 
-/** Consecutive unmeasurable samples before giving up on the target row. */
-const STALL_LIMIT: number = 3;
-
-/** Hard cap on corrections for one hold, so a pathological layout cannot spin. */
-const MAX_CORRECTIONS: number = 40;
+export function defaultAnchorOptions(): Required<AnchorOptions> {
+  return {
+    toleranceVp: 1.0,
+    stallLimit: 3,
+    maxCorrections: 40
+  };
+}
 
 /** Phases of one solve. See `step()`. */
 enum Phase {
@@ -117,6 +132,7 @@ function usable(rect: RectResult): boolean {
 }
 
 export class AnchorKeeper {
+  private readonly opts: Required<AnchorOptions>;
   private scroller: ListScroller | undefined = undefined;
 
   /** Index of the row that was at the top of the viewport. */
@@ -176,6 +192,21 @@ export class AnchorKeeper {
    */
   onSettled: () => void = () => {
   };
+
+  constructor(options?: AnchorOptions) {
+    this.opts = defaultAnchorOptions();
+    if (options !== undefined) {
+      if (options.toleranceVp !== undefined) {
+        this.opts.toleranceVp = options.toleranceVp;
+      }
+      if (options.stallLimit !== undefined) {
+        this.opts.stallLimit = options.stallLimit;
+      }
+      if (options.maxCorrections !== undefined) {
+        this.opts.maxCorrections = options.maxCorrections;
+      }
+    }
+  }
 
   attach(scroller: ListScroller): void {
     this.scroller = scroller;
@@ -314,7 +345,7 @@ export class AnchorKeeper {
       // Nothing has resized since the last correction; stay armed and idle.
       return;
     }
-    if (this.corrections > MAX_CORRECTIONS) {
+    if (this.corrections > this.opts.maxCorrections) {
       hilog.warn(DOMAIN, TAG, 'correction budget exhausted, releasing');
       this.release();
       return;
@@ -331,7 +362,7 @@ export class AnchorKeeper {
       // The row is not built (still recycled). Rather than wait a fixed time,
       // count the attempts and give up if it never materialises.
       this.stalls++;
-      if (this.stalls >= STALL_LIMIT) {
+      if (this.stalls >= this.opts.stallLimit) {
         hilog.warn(DOMAIN, TAG, 'row %{public}d never became measurable', this.index);
         this.dirty = false;
       } else {
@@ -353,7 +384,7 @@ export class AnchorKeeper {
 
     // ---- VERIFY: measure, refine `k` from what actually happened ----------
     const err: number = rect.y - this.savedY;
-    if (Math.abs(err) <= TOLERANCE_VP) {
+    if (Math.abs(err) <= this.opts.toleranceVp) {
       hilog.info(DOMAIN, TAG, 'converged y=%{public}s target=%{public}s k=%{public}s after %{public}d',
         rect.y.toFixed(1), this.savedY.toFixed(1), this.k.toFixed(4), this.corrections);
       this.dirty = false;

@@ -16,6 +16,100 @@
 
 ---
 
+## 0. 用起来：`AnchoredPaging`（业务无关，全部可配置）
+
+滚动效果本身和业务**完全解耦**，放在 `entry/src/main/ets/scroll/AnchoredPaging.ets`。
+它不知道什么叫 `pageSize`、不知道你的数据类型、不碰你的数组、不发起请求 ——
+它只告诉你**什么时候该加载**，并给你一个把「改数据」包起来的调用，好让位置在改动期间被保住。
+
+```ts
+import { AnchoredPaging, PULL_IDLE } from '../scroll/AnchoredPaging';
+
+private scroller: ListScroller = new ListScroller();
+private paging: AnchoredPaging = new AnchoredPaging({
+  prefetchRows: 2,       // 距末尾几行开始要下一页
+  pullThresholdVp: 80,   // 触顶后下拉多少 vp，松手才算一次请求
+  pullSteps: 10,         // 指示器进度格数
+  anchor: {
+    toleranceVp: 1.0,    // 位置恢复到这个误差内就算到位
+    maxCorrections: 40,  // 单次保持的失控保护
+    stallLimit: 3        // 连续几次量不到锚定行就放弃
+  }
+});
+
+aboutToAppear(): void {
+  this.paging.attach(this.scroller);
+  // 效果不持有数据：它只发问，你来回答。你原有的 loadOlder / loadNewer 原样保留。
+  this.paging.onRequestOlder = () => { this.loadOlder(); };
+  this.paging.onRequestNewer = () => { this.loadNewer(); };
+}
+```
+
+接线只有六个滚动回调（**没有手势**，表冠同样驱动）：
+
+```ts
+List({ scroller: this.scroller }) { /* 你自己的行 */ }
+  .onScrollIndex((s, e) => this.paging.handleScrollIndex(s, e, this.items.length))
+  .onScrollStart(() => this.paging.handleScrollStart())
+  .onScrollStop(() => this.paging.handleScrollStop())
+  .onReachStart(() => this.paging.handleReachStart())
+  .onScrollFrameBegin((o, st) => this.paging.handleScrollFrameBegin(o, st))
+// 每一行还要接一个：
+//   .onAreaChange(() => this.paging.handleRowResized())
+```
+
+你自己的加载逻辑里，把「改数据」这一步包进 `insertAnchored`：
+
+```ts
+private loadOlder(): void {
+  const page: MyItem[] = this.api.fetchOlder();      // 你的业务，你的分页大小
+  this.paging.insertAnchored(page.length, () => {     // 上方插入了 page.length 行
+    this.items = page.concat(this.items);             // 数组是你的，怎么改都行
+  });
+}
+
+private loadNewer(): void {
+  const page: MyItem[] = this.api.fetchNewer();
+  this.paging.insertAnchored(0, () => {               // 追加在下方，不移动锚点
+    this.items = this.items.concat(page);
+  });
+}
+```
+
+`insertAnchored` 在 `mutate()` **之前**抓锚点、**之后**开始保持 —— 这两步的先后顺序
+是调用方最容易搞错的地方，所以只通过这一个入口暴露。
+
+### 0.1 哪些是效果的参数，哪些是你的
+
+这是解耦的关键分界，不要混：
+
+| 属于**效果**（`AnchoredPagingOptions`） | 属于**你的业务**（效果完全不碰） |
+|---|---|
+| `prefetchRows` —— 距末尾多少行触发 | `pageSize` —— 一页多少条 |
+| `pullThresholdVp` —— 下拉多少才触发 | 数据源、请求、缓存 |
+| `pullSteps` —— 进度粒度 | `loadingOlder/loadingNewer` 等状态位 |
+| `anchor.toleranceVp` / `maxCorrections` / `stallLimit` | 空态、错误态、局部刷新 |
+
+判据很简单：**「滚动该怎么反应」是效果的；「数据从哪来、一次要多少」是你的。**
+
+### 0.2 效果暴露的可观测状态
+
+`AnchoredPaging` 是 `@ObservedV2`，字段带 `@Trace`，
+所以 `@ComponentV2` 的 `build()` 里**直接读就行**，不需要再拷进 `@Local`：
+
+| 字段 | 含义 |
+|---|---|
+| `pullStep` | `PULL_IDLE`(-1) 空闲；`0..pullSteps-1` 下拉中；`pullSteps` 松手即可加载 |
+| `holding` | 是否正在保持位置 |
+| `corrections` | 累计修正次数（排查用） |
+| `atTop` | 视口是否停在 row 0 |
+| `firstVisible` | 当前可见首行 |
+
+`ListPage.ets` 现在只是一个**演示宿主**：它只剩「行长什么样 / 数据从哪来 / 一页多少条」，
+所有滚动相关的代码都在效果里。想看你自己的项目该怎么接，直接对照那个文件。
+
+---
+
 ## 1. 要解决的问题
 
 列表里**每一条的高度都不一样**，而且**有些条目渲染很慢**：
@@ -225,16 +319,19 @@ W AceStateMgmt: __RepeatVirtualScroll2Impl(-1)) it is not allowed to use
 
 ## 7. 调参
 
-| 常量 | 位置 | 含义 |
+全部集中在 `AnchoredPaging` 的构造参数里（`ListPage.ets` 里那份就是示例值）：
+
+| 参数 | 默认 | 含义 |
 |---|---|---|
-| `PAGE_SIZE = 20` | `ListPage.ets` | 每页条数 |
-| `NETWORK_MS = 320` | `ListPage.ets` | 模拟网络延迟 |
-| `skeletonHeight = 68` | `FeedItem.ets` | 骨架高度，与真实高度差越大，抖动越明显 |
-| `delayMs = 240 + hash % 420` | `FeedItem.ets` | 慢条目延迟，故意做成乱序 |
-| `TOLERANCE_PX = 1.0` | `AnchorKeeper.ets` | 误差收敛阈值 |
-| `STEP_MS = 32` | `AnchorKeeper.ets` | 两次修正之间等多久（约两帧） |
-| `SETTLE_MS = 700` | `AnchorKeeper.ets` | 布局安静多久算"渲染完成"；**必须大于最慢条目的延迟**，否则会在条目落位前就解除保持 |
-| `HARD_LIMIT_MS = 4000` | `AnchorKeeper.ets` | 兜底上限，防止异常情况下无限修正 |
+| `prefetchRows` | 2 | 距**末尾**几行开始请求下一页 |
+| `pullThresholdVp` | 80 | 触顶后下拉多少 vp，松手才算一次「加载更早」 |
+| `pullSteps` | 10 | 指示条进度格数（量化，避免逐帧写状态） |
+| `anchor.toleranceVp` | 1.0 | 位置恢复到这个误差内即认为到位 |
+| `anchor.maxCorrections` | 40 | 单次保持的失控保护 |
+| `anchor.stallLimit` | 3 | 连续量不到锚定行几次就放弃 |
+
+不属于效果、留在宿主里的：`PAGE_SIZE`、数据源、加载状态位。
+另外 `cachedCount` 是 List 自己的属性，由宿主按行高设置。
 
 ## 8. 真机验证状态
 
@@ -258,6 +355,12 @@ W AceStateMgmt: __RepeatVirtualScroll2Impl(-1)) it is not allowed to use
 
 证据截图：`preview/frames/list-anchor-onsite.png`（V1 版的同机制对比）；
 本轮真机截图保存在 `/tmp/glowshot/`（`q0/q1/r1/r2`）。
+
+**重构为 `AnchoredPaging` 之后尚未重新上机**（本轮设备已断开，`hdc list targets` 返回空）。
+判定依据：效果类是把原页面里的滚动逻辑**原样搬移**，逻辑等价；
+唯一的行为差异是 `insertAnchored` 用 `firstVisible === 0` 决定是否顶对齐
+（原来的 `loadOlder` 无条件传 `true`），在本页的触发路径下两者等价。
+下次接上设备必须先跑一遍 §6 的三项。
 
 仍未验证 / 已知取舍：
 

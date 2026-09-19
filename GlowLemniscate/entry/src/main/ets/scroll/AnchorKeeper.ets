@@ -98,13 +98,77 @@ const TAG: string = 'AnchorKeeper';
  * These are injected rather than fixed, so the effect can be dropped into a
  * project that already has its own ideas about tolerances and budgets. Every
  * field has a default that works for a general-purpose list.
+ *
+ * All three are **convergence / give-up** knobs, not behaviour knobs: changing
+ * them alters how precisely the position is restored and how quickly the effect
+ * stops trying. None of them affects *when* paging happens — that is
+ * `AnchoredPagingConfig` (`prefetchRows`, `pullThresholdVp`).
+ *
+ * Where each one sits in one hold:
+ *
+ *     ALIGN   scrollToIndex(index, START, 0)     // brings the row into view
+ *     SOLVE   y0 = getItemRect(index).y          // <-- stallLimit guards this
+ *             extra = (savedY - y0) / k
+ *             scrollToIndex(index, START, extra)
+ *     VERIFY  err = getItemRect(index).y - savedY
+ *             |err| <= toleranceVp ? done        // <-- toleranceVp guards this
+ *             else refine k and correct again    // <-- maxCorrections guards this
+ *
+ * A normal hold is 2 corrections, which is the number all the defaults are
+ * sized against.
  */
 export interface AnchorOptions {
-  /** The position counts as restored once the row is within this many vp. */
+  /**
+   * The position counts as restored once the row is within this many vp.
+   *
+   * Not zero on purpose: `k` is measured rather than derived, `extraOffset` is
+   * quantised to physical pixels, and so is the layout. Chasing the last
+   * fraction means issuing more `scrollToIndex` calls, each of which costs a
+   * full layout pass, for something invisible. 1 vp is about 3.2 device px on
+   * a 3.24-density phone.
+   *
+   * Raise it and the row can come back visibly short (a clipped title, an
+   * obvious sliver). Lower it and a hold may never satisfy the quantisation, so
+   * every load runs until `maxCorrections` trips.
+   */
   toleranceVp?: number;
-  /** Consecutive unmeasurable samples before giving up on the target row. */
+  /**
+   * Consecutive samples where the anchored row cannot be measured before the
+   * effect stops trying for this hold.
+   *
+   * `getItemRect()` only reports rows the list has actually **built**. Under
+   * `Repeat` + `virtualScroll` a row outside the built window returns a
+   * zero-height rect. The ALIGN step scrolls to the row, which normally builds
+   * it, but that build is asynchronous relative to this loop.
+   *
+   * Counted **consecutively** — any successful measurement resets it to zero.
+   * One sample is a normal transient (the scroll was issued, the layout pass
+   * has not run yet), so 1 would give up on loads that actually work. Each
+   * retry is just a deferred re-check, never a wall-clock wait.
+   *
+   * Tripping it parks the hold (`dirty = false`) rather than dropping it: the
+   * next row resize retries. Note that it can trip harmlessly — when `savedY`
+   * is 0 the ALIGN step has already put the row at the top, which is the right
+   * answer anyway.
+   */
   stallLimit?: number;
-  /** Hard cap on corrections for one hold, so a pathological layout cannot spin. */
+  /**
+   * Hard cap on corrections for ONE hold — reset in `begin()`.
+   *
+   * Deliberately separate from the cumulative `restores` counter used for
+   * diagnostics. Using the cumulative value here was a real bug: once a session
+   * accumulated this many corrections the guard stayed tripped forever and
+   * anchoring silently died, with nothing obviously wrong in the log.
+   *
+   * Sized against a normal hold of 2. It exists for rows that resize on every
+   * layout pass (an animated placeholder, a self-referential height) or for a
+   * `savedY` that is simply unreachable — without it the effect would issue
+   * `scrollToIndex` on every event-loop turn forever, burning CPU *and* fighting
+   * the user, who would be unable to scroll away.
+   *
+   * Exceeding it calls `release()`, dropping the hold; the position stays where
+   * it ended up. Degrades to "no anchoring", never to a crash.
+   */
   maxCorrections?: number;
 }
 

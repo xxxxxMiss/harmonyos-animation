@@ -92,6 +92,34 @@ private loadNewer(): void {
 
 判据很简单：**「滚动该怎么反应」是效果的；「数据从哪来、一次要多少」是你的。**
 
+### 0.1.1 页大小按「轮次」算，不是常量
+
+聊天场景里一轮 = 1 个提问 + **N 个回答**（N 每次不同），所以**按轮次分页时每页条数是变的**，
+根本不存在「一页多少条」这种常量。本仓库的演示就是按这个来的：
+
+```ts
+const ROUNDS_PER_PAGE: number = 5;          // 业务常量：一页 5 轮
+
+const page: FeedItem[] = FeedSource.pageRounds(fromRound, ROUNDS_PER_PAGE);
+this.paging.insertAnchored(page.length, () => {   // ← 传实际行数，不是配置里的页大小
+  this.items = page.concat(this.items);
+});
+this.newerRound = fromRound + FeedSource.roundsIn(page);
+```
+
+一轮 1~5 个回答，所以 5 轮实际会返回 **10~30 条**，每次都不一样。
+**滚动效果为此一行都不用改** —— `insertAnchored` 收的是**实际插入行数**，
+`totalCount` 读的是真实数组长度，`prefetchRows` 本来就是「距末尾几行」而非绝对条数。
+这也是 §0.1 那张分界表的直接验证：效果不知道页大小，所以页大小怎么变都无所谓。
+
+演示里 HUD 同时显示两个数，就是为了让这件事可见：
+
+```
+42 轮 · 118 条消息  ·  首项 20  ·  锚定修正 2 次
+```
+
+前者是业务计数的，后者是派生的 —— 没有任何地方配置过 118。
+
 ### 0.2 效果暴露的可观测状态
 
 `AnchoredPaging` 是 `@ObservedV2`，字段带 `@Trace`，
@@ -321,16 +349,57 @@ W AceStateMgmt: __RepeatVirtualScroll2Impl(-1)) it is not allowed to use
 
 全部集中在 `AnchoredPaging` 的构造参数里（`ListPage.ets` 里那份就是示例值）：
 
+**行为参数**（决定「什么时候加载」）：
+
 | 参数 | 默认 | 含义 |
 |---|---|---|
 | `prefetchRows` | 2 | 距**末尾**几行开始请求下一页 |
 | `pullThresholdVp` | 80 | 触顶后下拉多少 vp，松手才算一次「加载更早」 |
 | `pullSteps` | 10 | 指示条进度格数（量化，避免逐帧写状态） |
-| `anchor.toleranceVp` | 1.0 | 位置恢复到这个误差内即认为到位 |
-| `anchor.maxCorrections` | 40 | 单次保持的失控保护 |
-| `anchor.stallLimit` | 3 | 连续量不到锚定行几次就放弃 |
 
-不属于效果、留在宿主里的：`PAGE_SIZE`、数据源、加载状态位。
+**锚定参数**（不改变加载时机，只决定「多精确」和「多快放弃」）。
+三个分别卡在保持循环的不同位置：
+
+```
+ALIGN   scrollToIndex(index, START, 0)     把锚定行拉进视口（顺带让它被构建）
+SOLVE   y0 = getItemRect(index).y          ← stallLimit 管这里（量不到就重试）
+        extra = (savedY - y0) / k
+        scrollToIndex(index, START, extra)
+VERIFY  err = getItemRect(index).y - savedY
+        |err| ≤ toleranceVp → 收敛          ← toleranceVp 管这里
+        否则 refine k 再修一轮               ← maxCorrections 管这里
+```
+
+一次正常保持是 **2 次修正**，三个默认值都是围绕这个事实留的余量。
+
+| 参数 | 默认 | 管什么 | 触发后果 |
+|---|---|---|---|
+| `anchor.toleranceVp` | 1.0 | **够不够近**（VERIFY 测误差） | 收敛停止修正，保持继续 |
+| `anchor.maxCorrections` | 40 | **修太多次了**（每次 `step()` 开头） | 整个保持被 `release()` |
+| `anchor.stallLimit` | 3 | **量不到目标行**（`getItemRect` 返空矩形） | 暂停本轮，布局再变会重试 |
+
+- **`toleranceVp` 为什么不取 0**：`k` 是测出来的、`extraOffset` 和布局都会被量化到物理像素。
+  追求 0 意味着反复发 `scrollToIndex`（每次都触发一整轮布局）换取看不见的收益。
+  这台设备 1216px/375vp = **3.243**，1vp ≈ 3.2 物理像素。
+  调大 → 行回来时肉眼可见地差一截；调小 → 可能永远满足不了量化，每轮都修到 `maxCorrections`。
+- **`maxCorrections` 必须是「单轮」计数**：它和累计的 `restores`（给 HUD 看的）严格分开。
+  **这里踩过真 bug** —— 最初拿累计值当预算，一个会话累计修满 40 次后闸门永久卡死、锚定静默失效，
+  日志上还看不出来。正常一轮 2 次，就算 20 行逐条撑开也就 5~8 次，40 是约 20 倍余量。
+- **`stallLimit` 是「连续」计数**：一旦量成功立刻归零。单次失败是正常瞬态
+  （`scrollToIndex` 发出去了、布局还没跑完），所以不能设 1。
+  超时动作是 **`dirty = false` 暂停本轮而不是 release**，下次任何一行改尺寸会重试，可恢复。
+  注意它超时**可能完全无害**：`savedY` 为 0 时 ALIGN 已经把行放到顶部，那本来就是正确答案。
+
+**排查对照**：
+
+| 现象 | 大概率是 | 怎么调 |
+|---|---|---|
+| 频繁 `row N never became measurable`，但位置其实对 | `stallLimit` 太小，把正常的「还没构建完」当失败 | 调大 `stallLimit` |
+| 每次都修很多轮才停，位置只差一点点 | `toleranceVp` 太小，在跟像素量化较劲 | `1.0` → `2.0` |
+| 出现 `correction budget exhausted` | 有行在反复改高（动画占位/自引用），或 `savedY` 不可达 | **先查数据**，再考虑调大 `maxCorrections` |
+| 恢复后明显偏了一截 | `toleranceVp` 太大，过早收敛 | 调小 `toleranceVp` |
+
+不属于效果、留在宿主里的：**页大小**（本演示是 `ROUNDS_PER_PAGE`，按轮计）、数据源、加载状态位。
 另外 `cachedCount` 是 List 自己的属性，由宿主按行高设置。
 
 ## 8. 真机验证状态

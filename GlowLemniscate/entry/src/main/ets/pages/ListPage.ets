@@ -3,19 +3,28 @@
  *
  * This page is deliberately *only* business logic:
  *
- *   · what a row looks like            (FeedRow)
+ *   · what a message looks like        (FeedRow)
  *   · where the data comes from        (FeedSource)
- *   · how many rows a page holds       (PAGE_SIZE)
+ *   · how much a page holds            (ROUNDS_PER_PAGE — counted in ROUNDS)
  *   · how it loads older / newer data  (loadOlder / loadNewer)
  *
  * Everything about *scrolling* — when a top pull counts as a request, when the
  * end prefetches, and how the reading position survives a layout change — lives
- * in `../scroll/AnchoredPaging.ets` and is configured, not inherited. Dropping
- * that effect into an existing project means constructing one `AnchoredPaging`
- * and wiring six callbacks; none of the host's own constants or loading logic
- * has to move.
+ * in `../scroll/AnchoredPaging.ets` and is configured, not inherited.
  *
- * The page also follows three project-wide constraints:
+ * The page size is counted in rounds, not rows
+ * --------------------------------------------
+ * This is a conversation: one round is one question plus 1..N answers, so a page
+ * of `ROUNDS_PER_PAGE` rounds delivers a **different number of rows every time**
+ * (between 2x and 6x the round count). There is no row-count constant anywhere,
+ * and there cannot be.
+ *
+ * Nothing in the scroll effect had to change for that. It is handed the length
+ * that actually came back — `insertAnchored(rows.length, …)` — and never a
+ * configured page size, so a flat feed and a round-based feed drive it
+ * identically. See `docs/LIST-SCROLL-ANCHOR.md` §0.1.
+ *
+ * Three project-wide constraints also apply:
  *
  * 1. **V2 state management** (`@ComponentV2` / `@Local` / `@Param` /
  *    `@ObservedV2` / `@Trace`). V1 and V2 components cannot be mixed in one tree,
@@ -28,17 +37,24 @@
  */
 
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { FeedItem, FeedSource } from '../model/FeedItem';
+import { FeedItem, FeedSource, MsgKind } from '../model/FeedItem';
 import { AnchoredPaging, PULL_IDLE } from '../scroll/AnchoredPaging';
 
-/** Business constant: rows per page. Belongs to the host, not to the effect. */
-const PAGE_SIZE: number = 20;
+/**
+ * Business constant: how many **rounds** one page holds.
+ *
+ * Note what is NOT here: a rows-per-page constant. A round carries 1..N answers,
+ * so the row count per page is computed from whatever came back. Everything that
+ * needs a count — `insertAnchored`, the list's `totalCount`, the prefetch
+ * threshold — reads the real array length.
+ */
+const ROUNDS_PER_PAGE: number = 5;
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'ListPage';
 
 /**
- * One row. `@Param` rather than a plain prop: a deferred row flips
+ * One message. `@Param` rather than a plain prop: a deferred row flips
  * `item.ready` when its content arrives, and `@ObservedV2` + `@Trace` on that
  * field turns it into a re-render of this one row instead of the whole list.
  */
@@ -61,58 +77,81 @@ struct FeedRow {
     }
   }
 
+  /** The 4vp accent bar that makes the round structure legible at a glance. */
+  @Builder
+  accent() {
+    Column()
+      .width(4)
+      .height('100%')
+      .backgroundColor(this.item.kind === MsgKind.QUESTION ? '#6C7BFF' : '#33334A')
+      .borderRadius(2)
+  }
+
   build() {
-    Column({ space: 6 }) {
-      if (this.item.ready) {
-        Row() {
+    Row({ space: 12 }) {
+      this.accent()
+
+      Column({ space: 6 }) {
+        if (this.item.ready) {
+          Row() {
+            Text(this.item.kind === MsgKind.QUESTION
+              ? ('第 ' + this.item.round + ' 轮 · 提问')
+              : ('第 ' + this.item.round + ' 轮 · 回答 ' + this.item.slot + ' / ' + this.item.answerCount))
+              .fontSize(11)
+              .fontColor(this.item.kind === MsgKind.QUESTION ? '#8A9BFF' : '#6A6A82')
+            Blank()
+          }
+          .width('100%')
+
           Text(this.item.title)
-            .fontSize(16)
-            .fontWeight(FontWeight.Medium)
-            .fontColor('#E8E8F0')
-            .layoutWeight(1)
+            .fontSize(this.item.kind === MsgKind.QUESTION ? 16 : 15)
+            .fontWeight(this.item.kind === MsgKind.QUESTION ? FontWeight.Medium : FontWeight.Normal)
+            .fontColor(this.item.kind === MsgKind.QUESTION ? '#E8E8F0' : '#C8C8DC')
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text('#' + this.item.seq)
+            .width('100%')
+
+          Text(this.item.preview)
             .fontSize(12)
             .fontColor('#7A7A92')
-        }
-        .width('100%')
+            .maxLines(1)
+            .width('100%')
 
-        Text(this.item.preview)
-          .fontSize(13)
-          .fontColor('#9A9AB0')
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          // Fills whatever height is left. Without this the taller rows are just
+          // empty space, which reads as a layout bug rather than as variable rows.
+          Column()
+            .width('100%')
+            .layoutWeight(1)
+            .backgroundColor('#1B1B26')
+            .borderRadius(8)
+        } else {
+          // Placeholder. Deliberately shorter than the real row, so the list is
+          // forced to re-lay out when the content lands.
+          Row({ space: 10 }) {
+            LoadingProgress()
+              .width(16)
+              .height(16)
+              .color('#6C7BFF')
+            Text('加载中…  ' + this.item.preview)
+              .fontSize(12)
+              .fontColor('#6A6A82')
+            Blank()
+          }
           .width('100%')
-
-        // Fills whatever height is left. Without this the taller rows are just
-        // empty space, which reads as a layout bug rather than as variable rows.
-        Column()
-          .width('100%')
-          .layoutWeight(1)
-          .backgroundColor('#1B1B26')
-          .borderRadius(8)
-      } else {
-        // Placeholder. Deliberately shorter than the real row, so the list is
-        // forced to re-lay out when the content lands.
-        Row({ space: 10 }) {
-          LoadingProgress()
-            .width(18)
-            .height(18)
-            .color('#6C7BFF')
-          Text('加载中…  #' + this.item.seq)
-            .fontSize(13)
-            .fontColor('#6A6A82')
-          Blank()
+          .height(24)
         }
-        .width('100%')
-        .height(28)
       }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
     .height(this.item.ready ? this.item.height : this.item.skeletonHeight)
-    .padding({ left: 16, right: 16, top: 12, bottom: 12 })
-    .backgroundColor(this.item.ready ? '#14141C' : '#0E0E14')
+    .padding({ left: 12, right: 16, top: 12, bottom: 12 })
+    // Answers are inset so a round reads as one visual block.
+    .margin({ left: this.item.kind === MsgKind.QUESTION ? 0 : 20 })
+    .backgroundColor(this.item.ready
+      ? (this.item.kind === MsgKind.QUESTION ? '#1A1A28' : '#14141C')
+      : '#0E0E14')
     .borderRadius(12)
     .onAreaChange((_oldValue: Area, _newValue: Area) => {
       // Fires both when a row first appears and when its height changes.
@@ -129,7 +168,9 @@ struct ListPage {
    * inside the routed page's first render pass, and ArkUI rejects state writes
    * there ("State variable ... has changed during render").
    */
-  @Local items: FeedItem[] = FeedSource.page(FeedSource.START_SEQ, PAGE_SIZE);
+  @Local items: FeedItem[] = FeedSource.pageRounds(FeedSource.START_ROUND, ROUNDS_PER_PAGE);
+  /** Display only: how many rounds the current rows span. */
+  @Local roundsShown: number = ROUNDS_PER_PAGE;
   @Local loadingNewer: boolean = false;
   @Local loadingOlder: boolean = false;
   /**
@@ -151,15 +192,26 @@ struct ListPage {
     pullThresholdVp: 80,    // vp past the top before a release loads earlier data
     pullSteps: 10,          // progress granularity of the indicator
     anchor: {
-      toleranceVp: 1.0,     // anchor considered restored within this many vp
-      maxCorrections: 40,   // runaway guard for one hold
-      stallLimit: 3         // give up after this many unmeasurable samples
+      // How close the anchored row must come back before the hold is considered
+      // restored. 1 vp is ~3.2 device px here — below perception. Tightening it
+      // just makes the loop chase pixel quantisation and run into
+      // `maxCorrections`; loosening it leaves a visible sliver.
+      toleranceVp: 1.0,
+      // Anti-runaway budget for ONE hold (reset in `begin()`). A normal hold
+      // needs 2 corrections, so this is ~20x headroom. It exists for rows that
+      // resize on every layout pass: without it the effect would keep issuing
+      // scrollToIndex forever and would fight the user's own scrolling.
+      maxCorrections: 40,
+      // Consecutive samples where the anchored row cannot be measured — with
+      // virtualScroll a row outside the built window reports no rect. 1 sample
+      // is a normal transient, 3 is enough grace without ever waiting on a clock.
+      stallLimit: 3
     }
   });
 
-  /** Business state: where the next page starts, in each direction. */
-  private olderFrom: number = 0;
-  private newerFrom: number = 0;
+  /** Business state: the next ROUND to load, in each direction. */
+  private olderRound: number = 0;
+  private newerRound: number = 0;
 
   aboutToAppear(): void {
     this.paging.attach(this.scroller);
@@ -171,8 +223,8 @@ struct ListPage {
       this.loadNewer();
     };
     // Plain fields only — no @Local writes during the first render pass.
-    this.olderFrom = FeedSource.START_SEQ - 1;
-    this.newerFrom = FeedSource.START_SEQ + PAGE_SIZE;
+    this.olderRound = FeedSource.START_ROUND - 1;
+    this.newerRound = FeedSource.START_ROUND + ROUNDS_PER_PAGE;
   }
 
   aboutToDisappear(): void {
@@ -183,46 +235,57 @@ struct ListPage {
   // Business logic. None of this is known to the scroll effect.
   // ---------------------------------------------------------------------------
 
-  /** Append the next page. Nothing was inserted above, so no anchor shift. */
+  /**
+   * Append the next N rounds.
+   *
+   * `page.length` is whatever that batch turned out to be — 2x to 6x the round
+   * count — and it is computed here, never configured anywhere.
+   */
   private loadNewer(): void {
-    if (this.loadingNewer || this.newerFrom > FeedSource.MAX_SEQ) {
+    if (this.loadingNewer || this.newerRound > FeedSource.MAX_ROUND) {
       return;
     }
     this.loadingNewer = true;
-    const from: number = this.newerFrom;
+    const fromRound: number = this.newerRound;
 
     // `setTimeout(fn, 0)` is only here to leave the layout pass that raised the
     // scroll event before touching state. It is not a simulated latency.
     setTimeout(() => {
-      const page: FeedItem[] = FeedSource.page(from, PAGE_SIZE);
+      const page: FeedItem[] = FeedSource.pageRounds(fromRound, ROUNDS_PER_PAGE);
+      // 0 rows were inserted above the anchor — this is an append.
       this.paging.insertAnchored(0, () => {
         this.items = this.items.concat(page);
       });
-      this.newerFrom = from + page.length;
+      this.newerRound = fromRound + FeedSource.roundsIn(page);
+      this.roundsShown += FeedSource.roundsIn(page);
       this.loadingNewer = false;
-      hilog.info(DOMAIN, TAG, 'loadNewer from=%{public}d -> items=%{public}d',
-        from, this.items.length);
+      hilog.info(DOMAIN, TAG, 'loadNewer rounds=%{public}d rows=%{public}d -> total %{public}d',
+        FeedSource.roundsIn(page), page.length, this.items.length);
     }, 0);
   }
 
-  /** Prepend the previous page. The rows land above, so they shift the anchor. */
+  /** Prepend the previous N rounds. Every row of them lands above the anchor. */
   private loadOlder(): void {
-    if (this.loadingOlder || this.olderFrom < FeedSource.MIN_SEQ) {
+    if (this.loadingOlder || this.olderRound < FeedSource.MIN_ROUND) {
       return;
     }
     this.loadingOlder = true;
-    const from: number = Math.max(FeedSource.MIN_SEQ, this.olderFrom - PAGE_SIZE + 1);
-    const count: number = this.olderFrom - from + 1;
+    // Walk backwards, clamped at the start of the conversation.
+    const fromRound: number = Math.max(FeedSource.MIN_ROUND,
+      this.olderRound - ROUNDS_PER_PAGE + 1);
 
     setTimeout(() => {
-      const page: FeedItem[] = FeedSource.page(from, count);
+      const page: FeedItem[] = FeedSource.pageRounds(fromRound, this.olderRound - fromRound + 1);
+      // `page.length`, not a constant: the anchor shifts by exactly the number
+      // of rows that were inserted above it.
       this.paging.insertAnchored(page.length, () => {
         this.items = page.concat(this.items);
       });
-      this.olderFrom = from - 1;
+      this.olderRound = fromRound - 1;
+      this.roundsShown += FeedSource.roundsIn(page);
       this.loadingOlder = false;
-      hilog.info(DOMAIN, TAG, 'loadOlder from=%{public}d n=%{public}d -> items=%{public}d',
-        from, page.length, this.items.length);
+      hilog.info(DOMAIN, TAG, 'loadOlder rounds=%{public}d rows=%{public}d -> total %{public}d',
+        FeedSource.roundsIn(page), page.length, this.items.length);
     }, 0);
   }
 
@@ -236,15 +299,15 @@ struct ListPage {
     Row() {
       if (this.loadingOlder) {
         LoadingProgress().width(16).height(16).color('#6C7BFF')
-        Text('正在加载更早的数据…').fontSize(12).fontColor('#8A8AA8').margin({ left: 8 })
+        Text('正在加载更早的对话…').fontSize(12).fontColor('#8A8AA8').margin({ left: 8 })
       } else if (this.paging.pullStep >= this.paging.config.pullSteps) {
-        Text('松开即可加载更早的数据').fontSize(12).fontColor('#7CE0A0')
+        Text('松开即可加载更早的对话').fontSize(12).fontColor('#7CE0A0')
       } else if (this.paging.pullStep > PULL_IDLE) {
-        Text('继续下拉加载更早的数据  ' + '█'.repeat(this.paging.pullStep) +
+        Text('继续下拉加载更早的对话  ' + '█'.repeat(this.paging.pullStep) +
           '░'.repeat(this.paging.config.pullSteps - this.paging.pullStep))
           .fontSize(12).fontColor('#8A8AA8')
       } else {
-        Text('已到顶部 · 下拉一段距离后松手可加载更早的数据')
+        Text('已到顶部 · 下拉一段距离后松手可加载更早的对话')
           .fontSize(12).fontColor('#5A5A70')
       }
     }
@@ -259,8 +322,8 @@ struct ListPage {
       if (this.loadingNewer) {
         LoadingProgress().width(20).height(20).color('#6C7BFF')
         Text('加载中…').fontSize(13).fontColor('#7A7A92').margin({ left: 8 })
-      } else if (this.newerFrom > FeedSource.MAX_SEQ) {
-        Text('— 已经到底了 —').fontSize(13).fontColor('#5A5A70')
+      } else if (this.newerRound > FeedSource.MAX_ROUND) {
+        Text('— 已经是最新的对话了 —').fontSize(13).fontColor('#5A5A70')
       } else {
         Text('继续滚动加载更多').fontSize(13).fontColor('#5A5A70')
       }
@@ -281,7 +344,7 @@ struct ListPage {
         .onClick(() => {
           this.getUIContext().getRouter().back();
         })
-      Text('长列表 · 滚动分页 · 滚动锚定')
+      Text('对话列表 · 按轮次分页 · 滚动锚定')
         .fontSize(15)
         .fontWeight(FontWeight.Medium)
         .fontColor('#E8E8F0')
@@ -296,8 +359,10 @@ struct ListPage {
     Column() {
       this.topBar()
 
-      Text('共 ' + this.items.length + ' 条  ·  首项 ' + this.paging.firstVisible +
-        '  ·  锚定修正 ' + this.paging.corrections + ' 次')
+      // The row count and the round count are both shown on purpose: the first
+      // is derived, the second is what the page size is actually counted in.
+      Text(this.roundsShown + ' 轮 · ' + this.items.length + ' 条消息  ·  首项 ' +
+        this.paging.firstVisible + '  ·  锚定修正 ' + this.paging.corrections + ' 次')
         .fontSize(11)
         .fontColor('#6A6A82')
         .width('100%')
@@ -324,7 +389,7 @@ struct ListPage {
       .layoutWeight(1)
       .cachedCount(3)
       .scrollBar(BarState.Auto)
-      // ---- the whole wiring: six scroll callbacks -------------------------
+      // ---- the whole wiring: five scroll callbacks + row onAreaChange ------
       .onScrollIndex((start: number, end: number) => {
         this.paging.handleScrollIndex(start, end, this.items.length);
       })

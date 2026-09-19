@@ -160,7 +160,19 @@ this.paging.insertAnchored(page.length, () => {             // 包住「改数�
 
 | 属于效果的参数 | 属于你的业务 |
 |---|---|
-| `prefetchRows`、`pullThresholdVp`、`pullSteps`、`anchor.*` | `pageSize`、数据源、加载状态位、空态/错误态 |
+| `prefetchRows`、`pullThresholdVp`、`pullSteps`、`anchor.*` | **页大小**、数据源、加载状态位、空态/错误态 |
+
+演示数据是一段**对话**：一轮 = 1 个提问 + 1~5 个回答，所以按轮次分页时
+**每页条数是变的**（5 轮 → 10~30 条），代码里根本没有「一页多少条」这个常量：
+
+```ts
+this.paging.insertAnchored(page.length, () => {   // 传实际行数，不是配置的页大小
+  this.items = page.concat(this.items);
+});
+```
+
+滚动效果为此一行都没改 —— 它从来没见过页大小。HUD 同时显示「42 轮 · 118 条」两个数，
+后者是派生的，没有任何地方配置过它。
 
 **判据：「滚动该怎么反应」是效果的；「数据从哪来、一次要多少」是你的。**
 

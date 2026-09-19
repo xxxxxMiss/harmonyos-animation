@@ -24,7 +24,6 @@ GlowLemniscate/build-profile.json5
 # HarmonyOS build output and caches
 # ---------------------------------------------------------------------------
 GlowLemniscate/.hvigor/
-GlowLemniscate/.idea/
 GlowLemniscate/build/
 GlowLemniscate/entry/build/
 GlowLemniscate/oh_modules/
@@ -33,6 +32,12 @@ GlowLemniscate/**/node_modules/
 GlowLemniscate/local.properties
 GlowLemniscate/.clangd
 GlowLemniscate/.clang-format
+
+# IDE metadata. Anchored with ** because DevEco creates one at every module
+# level, not just the project root — `entry/.idea/` appeared after the first
+# commit and was only caught by reviewing the staged file list.
+**/.idea/
+*.iml
 *.hap
 *.hsp
 

@@ -229,7 +229,33 @@ final: offset=3480 rowTop=3440 y=-40.0 target=-40
 | 手表 400-600ms | 单段 |
 | **手表 400-900ms · 分 3 段** | **最难的一档**，骨架→半高→定高 |
 
-切换会重新播种对话。**所有时间只在 `model/RenderLatency.ets` 里**——
+切换会重新播种对话。
+
+**延迟时间是否真的落在 400-600ms？** `RenderLatency.schedule()` 会把**请求值**和
+**实际触发值**都打进 hilog（`setTimeout` 只保证"不早于"，所以两者要分开看）：
+
+```
+schedule id=r82-m2 profile=手表 400-600ms seed=52150 total=572ms steps=1 at=[572]
+schedule id=r84-m0 profile=手表 400-600ms seed=6496  total=490ms steps=1 at=[490]
+fire     id=r82-m2 step=1/1 requested=572ms actual=572ms
+fire     id=r84-m0 step=1/1 requested=490ms actual=490ms
+```
+
+真机实测（400-600ms 档，16 个样本，含连续加载 79→105→128 条期间）：
+
+| | min | max | 平均 |
+|---|---|---|---|
+| requested | 404ms | 574ms | — |
+| **actual** | **407ms** | **575ms** | 483ms |
+| 偏差 | +0ms | +5ms | +1.2ms |
+
+**16/16 全部落在 400-600ms 窗口内。** 静态核算也一致：整段对话里 102 个异步行的
+请求值全部落在 401-599ms。
+
+`WATCH_STAGED`（400-900ms）分三段：第 1 段 134-299ms、第 2 段 268-599ms、
+第 3 段 401-898ms。
+
+**所有时间只在 `model/RenderLatency.ets` 里**——
 那是全工程唯一允许 `setTimeout(fn, ms)` 的地方，因为它在模拟流水线，
 而不是让机制去猜一个延迟。`scroll/` 目录下仍然零墙钟等待。
 

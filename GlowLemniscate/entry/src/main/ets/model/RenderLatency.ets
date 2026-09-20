@@ -21,7 +21,11 @@
  * which is the settle storm that broke the anchor.
  */
 
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { FeedItem } from './FeedItem';
+
+const DOMAIN: number = 0x0000;
+const TAG: string = 'RenderLatency';
 
 /** How long rows take to reach their final height, and in how many steps. */
 export enum LatencyProfile {
@@ -100,20 +104,45 @@ export class LatencyHarness {
    */
   static schedule(item: FeedItem, profile: LatencyProfile): void {
     if (profile === LatencyProfile.INSTANT) {
+      const t0: number = Date.now();
       setTimeout(() => {
         item.settle();
+        hilog.info(DOMAIN, TAG,
+          'fire id=%{public}s profile=INSTANT step=1/1 requested=0ms actual=%{public}dms',
+          item.id, Date.now() - t0);
       }, 0);
       return;
     }
+
     const total: number = LatencyHarness.delayFor(profile, item.seed);
     const steps: number = LatencyHarness.stages(profile);
+
+    // Compute every stage delay up front and log the plan, so the requested
+    // timings can be checked against the profile without waiting for them.
+    const ats: number[] = [];
     for (let s = 1; s <= steps; s++) {
       // Intermediate steps are fractions of the total, so a 3-stage row lands
       // at ~1/3 and ~2/3 of its final height before the last one.
-      const at: number = Math.round(total * (s / steps));
+      ats.push(Math.round(total * (s / steps)));
+    }
+    hilog.info(DOMAIN, TAG,
+      'schedule id=%{public}s profile=%{public}s seed=%{public}d total=%{public}dms steps=%{public}d at=[%{public}s]',
+      item.id, LatencyHarness.label(profile), item.seed, Math.round(total), steps, ats.join(','));
+
+    for (let s = 1; s <= steps; s++) {
+      const at: number = ats[s - 1];
       const step: number = s;
+      const t0: number = Date.now();
       setTimeout(() => {
+        // `setTimeout` only guarantees "not before". Logging the real elapsed
+        // time is what tells us whether the device actually settled within the
+        // profile's window, which is the property the whole harness exists to
+        // reproduce.
+        const actual: number = Date.now() - t0;
         item.advanceTo(step, steps);
+        hilog.info(DOMAIN, TAG,
+          'fire id=%{public}s step=%{public}d/%{public}d requested=%{public}dms actual=%{public}dms',
+          item.id, step, steps, at, actual);
       }, at);
     }
   }

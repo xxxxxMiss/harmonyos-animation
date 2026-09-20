@@ -62,19 +62,9 @@ const TAG: string = 'ListPage';
 @ComponentV2
 struct FeedRow {
   @Require @Param item: FeedItem;
-  /** Which latency profile to simulate when this row first appears. */
-  @Require @Param profile: LatencyProfile;
   /** Bubbles the row's size change up to the scroll effect. */
   @Event onSized: () => void = () => {
   };
-
-  aboutToAppear(): void {
-    if (!this.item.settled) {
-      // The timing lives entirely in `LatencyHarness`; see the note there about
-      // why that module, and only that module, is allowed wall-clock delays.
-      LatencyHarness.schedule(this.item, this.profile);
-    }
-  }
 
   /** The 4vp accent bar that makes the round structure legible at a glance. */
   @Builder
@@ -187,6 +177,8 @@ struct ListPage {
   @Local roundsShown: number = ROUNDS_PER_PAGE;
   /** Bumped on every re-seed so `Repeat` rebuilds rows with the new plan. */
   @Local generation: number = 0;
+  /** Shown in the HUD so the active profile is visible even off the bar. */
+  @Local profileInUse: string = LatencyHarness.label(LatencyProfile.INSTANT);
   @Local loadingNewer: boolean = false;
   @Local loadingOlder: boolean = false;
   /**
@@ -230,6 +222,9 @@ struct ListPage {
   private newerRound: number = 0;
 
   aboutToAppear(): void {
+    // The initial seed is built in a field initialiser, so its latency plan is
+    // started here; every later batch goes through `planRows()`.
+    this.planRows(this.items);
     this.paging.attach(this.scroller);
     // The effect never owns the data — it asks, and the host answers.
     this.paging.onRequestOlder = () => {
@@ -247,12 +242,35 @@ struct ListPage {
     this.paging.release();
   }
 
+  /**
+   * Starts the latency plan for a freshly created batch of rows.
+   *
+   * Deliberately NOT done in `FeedRow.aboutToAppear`. `Repeat` reuses row
+   * components by position, so a rebuild — a reseed, in particular — does not
+   * re-run that lifecycle hook, and the new items would never be scheduled.
+   * They then render at `currentHeight == skeletonHeight` forever, which is
+   * exactly the "one row stuck on 加载中…" that showed up on device.
+   *
+   * Scheduling belongs to whoever created the data, not to whoever happens to
+   * be rendering it.
+   */
+  private planRows(rows: FeedItem[]): FeedItem[] {
+    for (let i = 0; i < rows.length; i++) {
+      if (!rows[i].settled) {
+        LatencyHarness.schedule(rows[i], this.profile);
+      }
+    }
+    return rows;
+  }
+
   /** Re-seeds the conversation under a new latency profile. */
   private reseed(profile: LatencyProfile): void {
     this.profile = profile;
     this.generation++;
     const stages: number = LatencyHarness.stages(profile);
-    this.items = FeedSource.pageRounds(FeedSource.START_ROUND, ROUNDS_PER_PAGE, stages);
+    this.items = this.planRows(
+      FeedSource.pageRounds(FeedSource.START_ROUND, ROUNDS_PER_PAGE, stages));
+    this.profileInUse = LatencyHarness.label(profile);
     this.roundsShown = ROUNDS_PER_PAGE;
     this.olderRound = FeedSource.START_ROUND - 1;
     this.newerRound = FeedSource.START_ROUND + ROUNDS_PER_PAGE;
@@ -301,8 +319,8 @@ struct ListPage {
     // `setTimeout(fn, 0)` is only here to leave the layout pass that raised the
     // scroll event before touching state. It is not a simulated latency.
     setTimeout(() => {
-      const page: FeedItem[] = FeedSource.pageRounds(fromRound, ROUNDS_PER_PAGE,
-        LatencyHarness.stages(this.profile));
+      const page: FeedItem[] = this.planRows(FeedSource.pageRounds(fromRound, ROUNDS_PER_PAGE,
+        LatencyHarness.stages(this.profile)));
       // 0 rows were inserted above the anchor — this is an append.
       this.paging.insertAnchored(0, () => {
         this.items = this.items.concat(page);
@@ -326,8 +344,8 @@ struct ListPage {
       this.olderRound - ROUNDS_PER_PAGE + 1);
 
     setTimeout(() => {
-      const page: FeedItem[] = FeedSource.pageRounds(fromRound, this.olderRound - fromRound + 1,
-        LatencyHarness.stages(this.profile));
+      const page: FeedItem[] = this.planRows(FeedSource.pageRounds(fromRound,
+        this.olderRound - fromRound + 1, LatencyHarness.stages(this.profile)));
       // `page.length`, not a constant: the anchor shifts by exactly the number
       // of rows that were inserted above it.
       this.paging.insertAnchored(page.length, () => {
@@ -414,7 +432,8 @@ struct ListPage {
       // The row count and the round count are both shown on purpose: the first
       // is derived, the second is what the page size is actually counted in.
       Text(this.roundsShown + ' 轮 · ' + this.items.length + ' 条消息  ·  首项 ' +
-        this.paging.firstVisible + '  ·  锚定修正 ' + this.paging.corrections + ' 次')
+        this.paging.firstVisible + '  ·  锚定修正 ' + this.paging.corrections + ' 次  ·  ' +
+        this.profileInUse)
         .fontSize(11)
         .fontColor('#6A6A82')
         .width('100%')
@@ -429,7 +448,6 @@ struct ListPage {
             ListItem() {
               FeedRow({
                 item: ri.item,
-                profile: this.profile,
                 onSized: () => {
                   this.paging.handleRowResized();
                 }

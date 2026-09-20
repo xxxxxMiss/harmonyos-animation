@@ -71,6 +71,22 @@ export class LatencyHarness {
     }
   }
 
+  /** Compact form, for the demo's profile chips where the bar is only ~375 vp. */
+  static shortLabel(profile: LatencyProfile): string {
+    switch (profile) {
+      case LatencyProfile.INSTANT:
+        return '即时';
+      case LatencyProfile.FAST:
+        return '手机 120ms';
+      case LatencyProfile.WATCH:
+        return '手表 400-600ms';
+      case LatencyProfile.WATCH_STAGED:
+        return '手表分段 3 步';
+      default:
+        return '?';
+    }
+  }
+
   /** How many steps this profile moves a row through before it settles. */
   static stages(profile: LatencyProfile): number {
     return profile === LatencyProfile.WATCH_STAGED ? 3 : 1;

@@ -62,8 +62,20 @@ const TAG: string = 'ListPage';
 @ComponentV2
 struct FeedRow {
   @Require @Param item: FeedItem;
-  /** Bubbles the row's size change up to the scroll effect. */
-  @Event onSized: () => void = () => {
+  /**
+   * Position in the list. Needed so the effect can tell a row growing above the
+   * reading position — which shoves the reader — from one growing below it,
+   * which nobody can see.
+   */
+  @Require @Param index: number;
+  /**
+   * Bubbles the row's size change up to the scroll effect, in vp.
+   *
+   * The delta is reported rather than just a ping: the effect needs it to
+   * measure how much layout it absorbed, and the row is the only place that
+   * knows it.
+   */
+  @Event onSized: (index: number, deltaVp: number) => void = () => {
   };
 
   /** The 4vp accent bar that makes the round structure legible at a glance. */
@@ -83,9 +95,15 @@ struct FeedRow {
       Column({ space: 6 }) {
         if (this.item.settled) {
           Row() {
-            Text(this.item.kind === MsgKind.QUESTION
+            Text((this.item.kind === MsgKind.QUESTION
               ? ('第 ' + this.item.round + ' 轮 · 提问')
               : ('第 ' + this.item.round + ' 轮 · 回答 ' + this.item.slot + ' / ' + this.item.answerCount))
+              // The row's own height, on screen. It is the single number the
+              // whole effect reacts to, and printing it is what turns "rows
+              // render late" from a claim into something observable: on the
+              // watch profile it reads 60vp and then climbs to its final value
+              // 400-600 ms later.
+              + '  ·  ' + this.item.currentHeight + 'vp')
               .fontSize(11)
               .fontColor(this.item.kind === MsgKind.QUESTION ? '#8A9BFF' : '#6A6A82')
             Blank()
@@ -121,7 +139,7 @@ struct FeedRow {
               .width(16)
               .height(16)
               .color('#6C7BFF')
-            Text('加载中…  ' + this.item.preview)
+            Text('渲染中… ' + this.item.currentHeight + ' → ' + this.item.finalHeight + 'vp')
               .fontSize(12)
               .fontColor('#6A6A82')
             Blank()
@@ -143,15 +161,22 @@ struct FeedRow {
       : '#0E0E14')
     .borderRadius(12)
     .onAreaChange((oldValue: Area, newValue: Area) => {
-      // Only a HEIGHT change moves anything below this row, and only that is
-      // worth waking the anchor for.
+      // Two filters, and both are load-bearing.
       //
-      // `onAreaChange` also fires when a row enters or leaves the built window
-      // during a scroll — which the anchor's own align jump causes. Reporting
-      // those would mark every displacement as "the layout moved" and
-      // permanently block the effect from calibrating its unit mapping.
-      if (Number(oldValue.height) !== Number(newValue.height)) {
-        this.onSized();
+      // 1. Width changes are ignored: only a HEIGHT change moves anything below
+      //    this row, and only that is worth waking the hold for.
+      // 2. `before === 0` is a component being *constructed*, not a row
+      //    resizing — `onAreaChange` also fires when a row enters or leaves the
+      //    built window, which the hold's own align jump causes. Those carry no
+      //    displacement, and counting them made the absorbed-churn readout
+      //    meaningless: one rebuild reported every row in the list appearing
+      //    from nothing, inflating it from 241 vp to 2128 vp on device.
+      const before: number = Number(oldValue.height);
+      const after: number = Number(newValue.height);
+      if (before > 0 && before !== after) {
+        hilog.info(DOMAIN, TAG, 'rowSized %{public}s #%{public}d %{public}svp -> %{public}svp',
+          this.item.id, this.index, before.toFixed(0), after.toFixed(0));
+        this.onSized(this.index, after - before);
       }
     })
   }
@@ -166,19 +191,33 @@ struct ListPage {
    * there ("State variable ... has changed during render").
    */
   @Local items: FeedItem[] = FeedSource.pageRounds(
-    FeedSource.START_ROUND, ROUNDS_PER_PAGE, LatencyHarness.stages(LatencyProfile.INSTANT));
+    FeedSource.START_ROUND, ROUNDS_PER_PAGE, LatencyHarness.stages(LatencyProfile.WATCH));
   /**
-   * Which render-latency profile the demo simulates. Switch it to run the same
-   * code against a realistic watch settle storm — see `LatencyHarness`.
-   * Changing it re-seeds the conversation.
+   * Which render-latency profile the demo simulates. Switch it to compare.
+   *
+   * Defaults to the watch profile on purpose. It used to default to `INSTANT`,
+   * which made the page look broken in the other direction: with rows settling
+   * on the next tick the hold converges inside a frame or two, so the demo
+   * showed *nothing happening at all* — no late rows to observe, no reason for
+   * the anchoring to exist. The realistic case is the one worth opening on.
    */
-  @Local profile: LatencyProfile = LatencyProfile.INSTANT;
+  @Local profile: LatencyProfile = LatencyProfile.WATCH;
+  /**
+   * Demo-only switch: whether insertions go through the hold at all.
+   *
+   * Purely a host-side decision — `insertAnchored` is called or it is not, and
+   * the effect is untouched. It exists because "the anchor works" and "the rows
+   * really do render late" look identical from the outside: both are silent.
+   * Turning the hold off is what makes the second one visible, because the
+   * displacement it was absorbing then lands on screen.
+   */
+  @Local anchorOn: boolean = true;
   /** Display only: how many rounds the current rows span. */
   @Local roundsShown: number = ROUNDS_PER_PAGE;
   /** Bumped on every re-seed so `Repeat` rebuilds rows with the new plan. */
   @Local generation: number = 0;
   /** Shown in the HUD so the active profile is visible even off the bar. */
-  @Local profileInUse: string = LatencyHarness.label(LatencyProfile.INSTANT);
+  @Local profileInUse: string = LatencyHarness.label(LatencyProfile.WATCH);
   @Local loadingNewer: boolean = false;
   @Local loadingOlder: boolean = false;
   /**
@@ -275,25 +314,50 @@ struct ListPage {
     this.olderRound = FeedSource.START_ROUND - 1;
     this.newerRound = FeedSource.START_ROUND + ROUNDS_PER_PAGE;
     this.paging.release();
+    // A reseed replaces the whole conversation, so keeping the old offset would
+    // drop the reader into the middle of unrelated data.
+    this.scroller.scrollToIndex(0, true);
     hilog.info(DOMAIN, TAG, 'reseed profile=%{public}s stages=%{public}d rows=%{public}d',
       LatencyHarness.label(profile), stages, this.items.length);
   }
 
   @Builder
   profileBar() {
-    Row({ space: 6 }) {
-      ForEach([LatencyProfile.INSTANT, LatencyProfile.FAST,
-        LatencyProfile.WATCH, LatencyProfile.WATCH_STAGED], (p: LatencyProfile) => {
-        Text(LatencyHarness.label(p))
+    Column({ space: 6 }) {
+      Row({ space: 6 }) {
+        ForEach([LatencyProfile.INSTANT, LatencyProfile.FAST,
+          LatencyProfile.WATCH, LatencyProfile.WATCH_STAGED], (p: LatencyProfile) => {
+          Text(LatencyHarness.shortLabel(p))
+            .fontSize(10)
+            .fontColor(this.profile === p ? '#0B0B12' : '#8A8AA8')
+            .backgroundColor(this.profile === p ? '#6C7BFF' : '#1A1A28')
+            .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+            .borderRadius(6)
+            .onClick(() => {
+              this.reseed(p);
+            })
+        }, (p: LatencyProfile) => String(p))
+      }
+      .width('100%')
+
+      Row({ space: 8 }) {
+        Text(this.anchorOn ? '锚定 开' : '锚定 关')
           .fontSize(10)
-          .fontColor(this.profile === p ? '#0B0B12' : '#8A8AA8')
-          .backgroundColor(this.profile === p ? '#6C7BFF' : '#1A1A28')
+          .fontColor(this.anchorOn ? '#0B0B12' : '#E8A0A0')
+          .backgroundColor(this.anchorOn ? '#7CE0A0' : '#3A1A22')
           .padding({ left: 8, right: 8, top: 4, bottom: 4 })
           .borderRadius(6)
           .onClick(() => {
-            this.reseed(p);
+            this.anchorOn = !this.anchorOn;
           })
-      }, (p: LatencyProfile) => String(p))
+        Text(this.anchorOn
+          ? ('本次装载吸收了 ' + this.paging.churnVp.toFixed(0) + 'vp 高度变化，画面未移动')
+          : '锚定关闭：这些高度变化会直接落在画面上')
+          .fontSize(10)
+          .fontColor(this.anchorOn ? '#6A6A82' : '#C08080')
+          .layoutWeight(1)
+      }
+      .width('100%')
     }
     .width('100%')
     .padding({ left: 12, right: 12, bottom: 6 })
@@ -302,6 +366,24 @@ struct ListPage {
   // ---------------------------------------------------------------------------
   // Business logic. None of this is known to the scroll effect.
   // ---------------------------------------------------------------------------
+
+  /**
+   * Runs a data mutation through the hold — or not, when the demo's anchor
+   * switch is off.
+   *
+   * `insertAnchored` is the *only* thing the host has to remember, and this
+   * wrapper is where the host gets to decide whether to use it. With it off the
+   * list behaves like a plain List: the insertion lands, late rows grow, and the
+   * reader is thrown by exactly `paging.maxDriftVp` — which is the evidence that
+   * the latency is real and not something the harness merely logs.
+   */
+  private mutateAnchored(rowsInsertedAbove: number, mutate: () => void): void {
+    if (this.anchorOn) {
+      this.paging.insertAnchored(rowsInsertedAbove, mutate);
+    } else {
+      mutate();
+    }
+  }
 
   /**
    * Append the next N rounds.
@@ -322,7 +404,7 @@ struct ListPage {
       const page: FeedItem[] = this.planRows(FeedSource.pageRounds(fromRound, ROUNDS_PER_PAGE,
         LatencyHarness.stages(this.profile)));
       // 0 rows were inserted above the anchor — this is an append.
-      this.paging.insertAnchored(0, () => {
+      this.mutateAnchored(0, () => {
         this.items = this.items.concat(page);
       });
       this.newerRound = fromRound + FeedSource.roundsIn(page);
@@ -348,7 +430,7 @@ struct ListPage {
         this.olderRound - fromRound + 1, LatencyHarness.stages(this.profile)));
       // `page.length`, not a constant: the anchor shifts by exactly the number
       // of rows that were inserted above it.
-      this.paging.insertAnchored(page.length, () => {
+      this.mutateAnchored(page.length, () => {
         this.items = page.concat(this.items);
       });
       this.olderRound = fromRound - 1;
@@ -376,8 +458,14 @@ struct ListPage {
         Text('继续下拉加载更早的对话  ' + '█'.repeat(this.paging.pullStep) +
           '░'.repeat(this.paging.config.pullSteps - this.paging.pullStep))
           .fontSize(12).fontColor('#8A8AA8')
-      } else {
+      } else if (this.paging.atTop) {
         Text('已到顶部 · 下拉一段距离后松手可加载更早的对话')
+          .fontSize(12).fontColor('#5A5A70')
+      } else {
+        // The pull only arms at row 0, so saying "已到顶部" whenever the pull is
+        // idle told the reader they were at the top right after an anchored load
+        // had deliberately left them somewhere else.
+        Text('已加载更早的对话 · 回到最早一条再下拉可继续加载')
           .fontSize(12).fontColor('#5A5A70')
       }
     }
@@ -431,13 +519,18 @@ struct ListPage {
 
       // The row count and the round count are both shown on purpose: the first
       // is derived, the second is what the page size is actually counted in.
+      // `高度变化` is the honest headline number: it is the total size change
+      // rows reported while the reader's position was held. The per-correction
+      // drift readout is structurally near zero (the framework applies the
+      // correction inside the same layout pass as the resize), so printing that
+      // would suggest nothing happened.
       Text(this.roundsShown + ' 轮 · ' + this.items.length + ' 条消息  ·  首项 ' +
-        this.paging.firstVisible + '  ·  锚定修正 ' + this.paging.corrections + ' 次  ·  ' +
-        this.profileInUse)
+        this.paging.firstVisible + '  ·  修正 ' + this.paging.corrections + ' 次  ·  高度变化 ' +
+        this.paging.churnVp.toFixed(0) + 'vp ·  ' + this.profileInUse)
         .fontSize(11)
         .fontColor('#6A6A82')
         .width('100%')
-        .padding({ left: 16, right: 16, bottom: 6 })
+        .padding({ left: 16, right: 16, bottom: 4 })
 
       this.profileBar()
       this.pullStrip()
@@ -448,18 +541,28 @@ struct ListPage {
             ListItem() {
               FeedRow({
                 item: ri.item,
-                onSized: () => {
-                  this.paging.handleRowResized();
+                index: ri.index,
+                onSized: (index: number, deltaVp: number) => {
+                  this.paging.handleRowResized(index, deltaVp);
                 }
               })
             }
           })
           .key((item: FeedItem) => this.generation + '/' + item.id)
+          // Virtual scrolling was commented out here for several revisions while
+          // the hold was being debugged, which quietly turned the demo into a
+          // build-everything list: every row stayed built, so every row kept
+          // reporting area changes and the anchor's calibration window never
+          // behaved the way a real long list makes it behave. It is required for
+          // the case this effect exists for, and it works under V2.
           .virtualScroll({ totalCount: this.items.length })
       }
       .width('100%')
       .layoutWeight(1)
-      .cachedCount(3)
+      // Off-screen rows kept built, on top of the built window. A row that has
+      // scrolled just out of view still finishes its late render here instead of
+      // being recycled mid-flight.
+      .cachedCount(8)
       .scrollBar(BarState.Auto)
       // ---- the whole wiring: five scroll callbacks + row onAreaChange ------
       .onScrollIndex((start: number, end: number) => {

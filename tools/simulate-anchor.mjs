@@ -187,6 +187,9 @@ class Keeper {
     this.budgetTripped = false;
     this.layoutEvents = 0;
     this.reArmedByScroll = 0;
+    // Largest displacement measured at VERIFY, in vp. Diagnostics only.
+    this.lastDrift = 0;
+    this.maxDrift = 0;
   }
 
   capture(i) {
@@ -207,6 +210,8 @@ class Keeper {
     this.holdTotal = 0;
     this.y0Clean = false;
     this.awaitingScroll = false;
+    this.lastDrift = 0;
+    this.maxDrift = 0;
     this.active = true;
     this.dirty = true;
     this.arm();
@@ -303,6 +308,10 @@ class Keeper {
 
     // ---- VERIFY -----------------------------------------------------------
     const err = rect.y - this.savedY;
+    // Measured before anything is corrected, so it is the displacement the
+    // layout actually applied to the reader — see `maxDrift` in the results.
+    this.lastDrift = err;
+    if (Math.abs(err) > this.maxDrift) { this.maxDrift = Math.abs(err); }
     if (Math.abs(err) <= this.opts.toleranceVp) {
       this.dirty = false;
       // The guard counts attempts that did NOT converge, so a long but
@@ -421,6 +430,8 @@ function run(cfg) {
     budgetTripped: keeper.budgetTripped,
     stalled: keeper.stalled === true,
     lastSettle: Math.round(lastSettle),
+    // What the reader would have been thrown by had nothing held the position.
+    maxDrift: +keeper.maxDrift.toFixed(1),
     finalErr: +(finalY - target).toFixed(1),
     worst: +worst.toFixed(1)
   };
@@ -439,8 +450,8 @@ const scenarios = [
 
 console.log('Scroll-anchor simulation — does the hold survive a realistic settle storm?');
 console.log('watch viewport 400 vp, 3 cached rows, 20-30 rows inserted above the anchor\n');
-console.log('scenario'.padEnd(42) + 'settle  corrections  layoutEvt  budget   finalErr  worst');
-console.log('-'.repeat(94));
+console.log('scenario'.padEnd(42) + 'settle  corrections  layoutEvt  budget   finalErr  worst  maxDrift');
+console.log('-'.repeat(103));
 
 const results = [];
 for (const [name, cfg] of scenarios) {
@@ -453,7 +464,8 @@ for (const [name, cfg] of scenarios) {
     String(r.layoutEvents).padStart(11) +
     String(r.budgetTripped ? 'TRIPPED' : 'ok').padStart(9) +
     String(r.finalErr + 'vp').padStart(10) +
-    String(r.worst + 'vp').padStart(8));
+    String(r.worst + 'vp').padStart(8) +
+    String(r.maxDrift + 'vp').padStart(10));
 }
 
 // Diagnostic: what happens to y over time in scenario B (the failing short-latency case)?

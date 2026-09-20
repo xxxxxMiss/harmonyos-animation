@@ -126,6 +126,18 @@ export class AnchoredPaging {
    * host would otherwise see.
    */
   @Trace firstVisible: number = 0;
+  /**
+   * How far the anchored row drifted during the current hold, in vp, and the
+   * worst it got. These are the displacement the hold absorbed: what the reader
+   * would have been thrown by had nothing been holding the position. Diagnostics
+   * only — nothing in the effect reads them back.
+   */
+  @Trace lastDriftVp: number = 0;
+  @Trace maxDriftVp: number = 0;
+  /** Layout changes the current hold has been told about. See `AnchorKeeper`. */
+  @Trace layoutEvents: number = 0;
+  /** Height churn absorbed by the current hold, in vp. See `AnchorKeeper`. */
+  @Trace churnVp: number = 0;
 
   private readonly keeper: AnchorKeeper;
   private scroller: ListScroller | undefined = undefined;
@@ -150,6 +162,10 @@ export class AnchoredPaging {
     this.keeper.onSettled = () => {
       this.holding = this.keeper.isHolding();
       this.corrections = this.keeper.restores;
+      this.lastDriftVp = this.keeper.lastDriftVp;
+      this.maxDriftVp = this.keeper.maxDriftVp;
+      this.layoutEvents = this.keeper.layoutEvents;
+      this.churnVp = this.keeper.churnVp;
     };
   }
 
@@ -260,9 +276,16 @@ export class AnchoredPaging {
     this.atTop = true;
   }
 
-  /** Wire every row's `onAreaChange` to this. */
-  handleRowResized(): void {
-    this.keeper.notifyLayoutChanged();
+  /**
+   * Wire every row's `onAreaChange` to this.
+   *
+   * @param index the row's index in the list.
+   * @param deltaVp the row's signed height change in vp. Reporting both is what
+   *        lets the effect measure how much layout it absorbed *above the
+   *        reading position* — see `AnchorKeeper.churnVp`.
+   */
+  handleRowResized(index: number = -1, deltaVp: number = 0): void {
+    this.keeper.notifyLayoutChanged(index, deltaVp);
   }
 
   // -------------------------------------------------------------------------

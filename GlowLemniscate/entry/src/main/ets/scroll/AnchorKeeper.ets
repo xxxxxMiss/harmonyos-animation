@@ -267,12 +267,53 @@ export class AnchorKeeper {
 
   /** Diagnostics for the on-screen HUD. */
   restores: number = 0;
+  /**
+   * How far the anchored row had drifted the last time it was measured, in vp.
+   *
+   * This is the *observable consequence of late rendering*: the anchored row
+   * cannot move unless something above it changed size, so this number is
+   * literally how far the page shifted under the reader while content was
+   * arriving. With the hold active it is corrected back to zero and nothing is
+   * seen; with the hold off it accumulates into the visible jump.
+   *
+   * It is measured in `VERIFY`, i.e. **before** the correction is applied, so it
+   * reports the displacement rather than the residue of fixing it.
+   */
+  lastDriftVp: number = 0;
+  /** Largest `|lastDriftVp|` seen during the current hold. Reset in `begin()`. */
+  maxDriftVp: number = 0;
+  /**
+   * Layout changes reported to the hold since `begin()`.
+   *
+   * This is the counter that answers "did the late rendering actually disturb
+   * the list?". A row can settle without ever reaching here — under
+   * `virtualScroll` a row outside the built window is not in the tree, so its
+   * height changes nothing and fires no `onAreaChange`. Late renders that no
+   * one measures are late renders that cannot move the reader, so the honest way
+   * to report the demo is to count what arrived, not what was scheduled.
+   */
+  layoutEvents: number = 0;
+  /**
+   * Total absolute height change, in vp, reported by rows **above** the reading
+   * position while the hold was active — the layout churn the hold sat through.
+   *
+   * This is the number that makes late rendering *visible as a quantity*. The
+   * drift counters above cannot report it: `scrollToIndex` is applied by the
+   * framework during the very layout pass in which the resize happens, so by the
+   * time `VERIFY` measures, the position is already restored and the residue is
+   * zero. What is left to measure is the displacement that was absorbed, and
+   * that is this sum: with no hold in the way it is exactly how far the content
+   * above the reader would have moved.
+   *
+   * Diagnostics only — nothing in the effect reads it back.
+   */
+  churnVp: number = 0;
 
   /**
-   * Called whenever the hold converges or is dropped, so the owner can refresh
-   * any readout of the current position. Without it a HUD refreshed from a
-   * scroll callback would still show the pre-correction state, because the
-   * correction lands after that callback.
+   * Called whenever the hold's measured state changes — it converged, it drifted,
+   * or it was dropped — so the owner can refresh any readout of the current
+   * position. Without it a HUD refreshed from a scroll callback would still show
+   * the pre-correction state, because the correction lands after that callback.
    */
   onSettled: () => void = () => {
   };
@@ -367,6 +408,10 @@ export class AnchorKeeper {
     this.holdTotal = 0;
     this.cleanWindow = false;
     this.awaitingScroll = false;
+    this.lastDriftVp = 0;
+    this.maxDriftVp = 0;
+    this.layoutEvents = 0;
+    this.churnVp = 0;
     this.active = true;
     this.dirty = true;
     hilog.info(DOMAIN, TAG, 'begin index=%{public}d savedY=%{public}s',
@@ -378,9 +423,22 @@ export class AnchorKeeper {
    * A row resized. Every row wires `onAreaChange` to this, which is what makes
    * the keeper react to rows that settle long after the data arrived.
    */
-  notifyLayoutChanged(): void {
+  /**
+   * @param index the resized row's index in the list.
+   * @param deltaVp its signed height change in vp.
+   *
+   * Both are passed in because only the row knows them, and the pair is what
+   * makes `churnVp` mean something: a row growing *below* the reading position
+   * pushes nothing the reader can see, so it is not churn. Only growth above
+   * the anchor moves it.
+   */
+  notifyLayoutChanged(index: number = -1, deltaVp: number = 0): void {
     if (!this.active) {
       return;
+    }
+    this.layoutEvents++;
+    if (deltaVp !== 0 && index >= 0 && index < this.index) {
+      this.churnVp += Math.abs(deltaVp);
     }
     this.dirty = true;
     // A row resized, so everything below it shifted. Any slope derived across
@@ -495,6 +553,18 @@ export class AnchorKeeper {
 
     // ---- VERIFY ---------------------------------------------------------
     const err: number = rect.y - this.savedY;
+    // Recorded before anything is corrected, so it reports how far the layout
+    // actually moved the reader — see `lastDriftVp`.
+    this.lastDriftVp = err;
+    if (Math.abs(err) > this.maxDriftVp) {
+      this.maxDriftVp = Math.abs(err);
+    }
+    if (Math.abs(err) > this.opts.toleranceVp) {
+      hilog.info(DOMAIN, TAG,
+        'drift id=%{public}d y=%{public}s target=%{public}s drift=%{public}s vp (re-pinning)',
+        this.index, rect.y.toFixed(1), this.savedY.toFixed(1), err.toFixed(1));
+    }
+    this.onSettled();
     if (Math.abs(err) <= this.opts.toleranceVp) {
       hilog.info(DOMAIN, TAG, 'converged y=%{public}s target=%{public}s k=%{public}s after %{public}d',
         rect.y.toFixed(1), this.savedY.toFixed(1), this.k.toFixed(4), this.holdTotal);

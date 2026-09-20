@@ -301,10 +301,32 @@ export class AnchoredPaging {
    * When rows go in above, the viewport is at row 0 by definition, so the anchor
    * is pinned to the top rather than to a measured offset — a measured `y` would
    * include any spring overscroll still in flight and be restored with it.
+   *
+   * Calling this repeatedly for a *loop* of insertions is supported
+   * ---------------------------------------------------------------
+   * Feeding a page in one row at a time (`items.unshift(row)` per turn) is a
+   * normal thing for a host to do, and it is exactly where a naive
+   * capture-per-call goes wrong:
+   *
+   *   · `firstVisible` is refreshed only by a scroll event, and a tight
+   *     insertion loop outruns those. Re-capturing from it on every iteration
+   *     therefore re-anchors to the row that *used* to be first, which the
+   *     previous iteration has already pushed away — so the anchor falls a row
+   *     further behind each time and the reader drifts by the whole page.
+   *   · Re-measuring `savedY` mid-loop is worse still: the layout is in flight,
+   *     so `getItemRect().y` describes a half-applied state, and the hold would
+   *     faithfully restore that wrong offset.
+   *
+   * So while a hold is already live, its own anchor is the authority: `shift()`
+   * has kept the index in step with every insertion, and `savedY` is the
+   * position the hold has been maintaining. Capture is for *starting* a hold,
+   * not for continuing one.
    */
   insertAnchored(rowsInsertedAbove: number, mutate: () => void): void {
-    const wasAtTop: boolean = this.firstVisible === 0;
-    this.keeper.capture(this.firstVisible, wasAtTop);
+    if (!this.keeper.isHolding()) {
+      const wasAtTop: boolean = this.firstVisible === 0;
+      this.keeper.capture(this.firstVisible, wasAtTop);
+    }
     mutate();
     if (rowsInsertedAbove !== 0) {
       this.keeper.shift(rowsInsertedAbove);

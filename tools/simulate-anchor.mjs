@@ -134,6 +134,16 @@ class FakeList {
     return this.rowTop(i) - this.scrollOffset;
   }
 
+  /** The topmost row that is at least partly on screen, as onScrollIndex reports. */
+  firstVisibleIndex() {
+    for (let i = 0; i < this.rowCount; i++) {
+      if (this.y(i) + this.heights[i] > 0) {
+        return i;
+      }
+    }
+    return this.rowCount - 1;
+  }
+
   /** Only rows inside the built window report a rect — as with virtualScroll. */
   getItemRect(i) {
     if (i < 0 || i >= this.rowCount || !Number.isFinite(this.heights[i])) {
@@ -437,6 +447,89 @@ function run(cfg) {
   };
 }
 
+/**
+ * The same page, handed over one row at a time.
+ *
+ * This is `AnchoredPaging.insertAnchored` being called once per row — the shape
+ * a feed has when it unshifts each item as it arrives. Every row still goes in
+ * before the first frame boundary, so no scroll event can land between them:
+ * that is the tightest form of the loop, and it matches what a
+ * `setTimeout(fn, 0)` chain actually does on device (21 rows in about 5 ms).
+ *
+ * The rows, their heights and their settle times are **identical** to `run()`.
+ * The only variable is how many times the anchor is captured.
+ *
+ * `cfg.captureEveryCall` reproduces the pre-fix behaviour, where `insertAnchored`
+ * re-read the page's `firstVisible` on every call even though a hold was already
+ * running. `firstVisible` is refreshed only by a scroll event, so during a burst
+ * it does not move while `shift()` does — and each iteration drags the anchor
+ * back to the row that used to be first.
+ */
+function runPerRow(cfg) {
+  const list = new FakeList(cfg.viewportH, cfg.cacheRows);
+  list.setRows(makeRows(cfg.rows, cfg, 1));
+  list.advanceTo(0);
+
+  const keeper = new Keeper(list, cfg.anchor);
+  list.scrollOffset = Math.min(list.maxScroll, list.rowTop(cfg.anchorIndex) + 40);
+  keeper.capture(cfg.anchorIndex);
+  const targetY = keeper.savedY;
+
+  const queue = makeRows(cfg.inserted, cfg, 101);
+  // The page's own notion of the first visible row — refreshed by scroll events
+  // only, exactly like `List.onScrollIndex`. This coupling is the whole point.
+  const page = { firstVisible: cfg.anchorIndex };
+
+  for (let k = 0; k < queue.length; k++) {
+    // ---- insertAnchored(1, mutate) ----
+    if (cfg.captureEveryCall || !keeper.active) {
+      keeper.capture(page.firstVisible);
+    }
+    list.prependRows([queue[k]]);
+    keeper.shift(1);
+    keeper.begin();
+  }
+
+  const samples = [];
+  for (let t = 0; t <= cfg.durationMs; t += 16) {
+    const changed = list.advanceTo(t);
+    for (let c = 0; c < changed; c++) {
+      keeper.notifyLayoutChanged();
+    }
+    if (keeper.scrollPending) {
+      keeper.scrollPending = false;
+      keeper.onScrollSettled();
+      page.firstVisible = list.firstVisibleIndex();
+    }
+    keeper.tick();
+    samples.push({ t, y: list.y(keeper.index) });
+  }
+
+  list.advanceTo(cfg.durationMs + 2000);
+  const finalY = list.y(keeper.index);
+  let lastSettle = 0;
+  for (const r of list.rows) {
+    for (const st of r.stages) {
+      lastSettle = Math.max(lastSettle, st.at);
+    }
+  }
+  let worst = 0;
+  for (const s of samples) {
+    if (s.t >= cfg.durationMs - 300 && Math.abs(s.y - targetY) > Math.abs(worst)) {
+      worst = s.y - targetY;
+    }
+  }
+  return {
+    restores: keeper.holdTotal,
+    layoutEvents: keeper.layoutEvents,
+    budgetTripped: keeper.budgetTripped,
+    lastSettle: Math.round(lastSettle),
+    maxDrift: +keeper.maxDrift.toFixed(1),
+    finalErr: +(finalY - targetY).toFixed(1),
+    worst: +worst.toFixed(1)
+  };
+}
+
 // ---------------------------------------------------------------------------
 
 const scenarios = [
@@ -469,6 +562,43 @@ for (const [name, cfg] of scenarios) {
 }
 
 // Diagnostic: what happens to y over time in scenario B (the failing short-latency case)?
+// ---------------------------------------------------------------------------
+// Batch vs per-row insertion, same data and same settle times.
+// ---------------------------------------------------------------------------
+
+const loopCfg = { ...base, minLatency: 400, maxLatency: 600 };
+const batchR = run(loopCfg);
+const loopBug = runPerRow({ ...loopCfg, captureEveryCall: true });
+const loopFix = runPerRow({ ...loopCfg, captureEveryCall: false });
+
+console.log();
+console.log('--- 整页插入 vs 逐条 unshift（数据、延迟完全相同）---');
+console.log('mode'.padEnd(46) + 'captures  finalErr   worst  maxDrift');
+console.log('-'.repeat(84));
+const modes = [
+  ['整页 concat  · 一次 insertAnchored(n)', batchR, 1],
+  ['逐条 unshift · 修复前（每次重新 capture）', loopBug, loopCfg.inserted],
+  ['逐条 unshift · 修复后（hold 期间不 capture）', loopFix, 1]
+];
+for (const [name, r, caps] of modes) {
+  console.log(
+    name.padEnd(46) +
+    String(caps).padStart(8) +
+    String(r.finalErr + 'vp').padStart(10) +
+    String(r.worst + 'vp').padStart(8) +
+    String(r.maxDrift + 'vp').padStart(10));
+}
+const loopBroken = Math.abs(loopBug.finalErr) > 2;
+const loopOk = Math.abs(loopFix.finalErr) <= 2;
+console.log();
+if (loopBroken && loopOk) {
+  console.log('逐条插入回归通过 —— 修复前锚点丢失 ' + loopBug.finalErr +
+    'vp，修复后为 ' + loopFix.finalErr + 'vp。');
+} else {
+  console.log('逐条插入回归 FAIL —— 期望「修复前丢失、修复后为 0」，实际 ' +
+    loopBug.finalErr + 'vp / ' + loopFix.finalErr + 'vp。');
+}
+
 console.log();
 console.log('--- y trace for scenario B (120ms) ---');
 {

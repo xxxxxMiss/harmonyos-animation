@@ -55,6 +55,25 @@ const DOMAIN: number = 0x0000;
 const TAG: string = 'ListPage';
 
 /**
+ * How a loaded page is handed to the list.
+ *
+ * This is the difference that decides whether a prepend disturbs the reader, and
+ * it has nothing to do with the scroll effect — it is a property of the data
+ * source. Both modes are here so the two can be compared on the same device, on
+ * the same profile, with the same data.
+ *
+ * · `BATCH`   — build the page, then replace the array once.
+ *               One mutation, one diff, one layout pass.
+ * · `PER_ROW` — `unshift` one row per event-loop turn, which is what a feed that
+ *               emits items as they arrive looks like. Each row is a separate
+ *               mutation, so the content above the reader grows N times.
+ */
+export enum InsertMode {
+  BATCH = 0,
+  PER_ROW = 1
+}
+
+/**
  * One message. `@Param` rather than a plain prop: a deferred row flips
  * `item.ready` when its content arrives, and `@ObservedV2` + `@Trace` on that
  * field turns it into a re-render of this one row instead of the whole list.
@@ -212,6 +231,8 @@ struct ListPage {
    * displacement it was absorbing then lands on screen.
    */
   @Local anchorOn: boolean = true;
+  /** How a loaded page reaches the list — see `InsertMode`. */
+  @Local insertMode: InsertMode = InsertMode.BATCH;
   /** Display only: how many rounds the current rows span. */
   @Local roundsShown: number = ROUNDS_PER_PAGE;
   /** Bumped on every re-seed so `Repeat` rebuilds rows with the new plan. */
@@ -350,9 +371,19 @@ struct ListPage {
           .onClick(() => {
             this.anchorOn = !this.anchorOn;
           })
+        Text(this.insertMode === InsertMode.BATCH ? '整页插入' : '逐条 unshift')
+          .fontSize(10)
+          .fontColor('#C8C8DC')
+          .backgroundColor('#22222E')
+          .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+          .borderRadius(6)
+          .onClick(() => {
+            this.insertMode = this.insertMode === InsertMode.BATCH
+              ? InsertMode.PER_ROW : InsertMode.BATCH;
+          })
         Text(this.anchorOn
-          ? ('本次装载吸收了 ' + this.paging.churnVp.toFixed(0) + 'vp 高度变化，画面未移动')
-          : '锚定关闭：这些高度变化会直接落在画面上')
+          ? ('吸收了 ' + this.paging.churnVp.toFixed(0) + 'vp，画面未移动')
+          : '高度变化会直接落在画面上')
           .fontSize(10)
           .fontColor(this.anchorOn ? '#6A6A82' : '#C08080')
           .layoutWeight(1)
@@ -424,20 +455,57 @@ struct ListPage {
     // Walk backwards, clamped at the start of the conversation.
     const fromRound: number = Math.max(FeedSource.MIN_ROUND,
       this.olderRound - ROUNDS_PER_PAGE + 1);
+    const span: number = this.olderRound - fromRound + 1;
 
     setTimeout(() => {
-      const page: FeedItem[] = this.planRows(FeedSource.pageRounds(fromRound,
-        this.olderRound - fromRound + 1, LatencyHarness.stages(this.profile)));
-      // `page.length`, not a constant: the anchor shifts by exactly the number
-      // of rows that were inserted above it.
-      this.mutateAnchored(page.length, () => {
-        this.items = page.concat(this.items);
-      });
+      const page: FeedItem[] = this.planRows(
+        FeedSource.pageRounds(fromRound, span, LatencyHarness.stages(this.profile)));
       this.olderRound = fromRound - 1;
       this.roundsShown += FeedSource.roundsIn(page);
+      hilog.info(DOMAIN, TAG, 'loadOlder rounds=%{public}d rows=%{public}d mode=%{public}s',
+        FeedSource.roundsIn(page), page.length,
+        this.insertMode === InsertMode.BATCH ? 'batch' : 'perRow');
+
+      if (this.insertMode === InsertMode.BATCH) {
+        // `page.length`, not a constant: the anchor shifts by exactly the number
+        // of rows that were inserted above it.
+        this.mutateAnchored(page.length, () => {
+          this.items = page.concat(this.items);
+        });
+        this.loadingOlder = false;
+        return;
+      }
+      this.prependOneByOne(page, page.length - 1);
+    }, 0);
+  }
+
+  /**
+   * Hands the page over one row per event-loop turn.
+   *
+   * `setTimeout(fn, 0)` and nothing else: one row per turn is a *cadence*, not a
+   * guessed duration, and it is the tightest version of what a feed that emits
+   * items one at a time does. Each row is its own mutation, so `insertAnchored`
+   * runs once per row — which is the case the loop-safe path in
+   * `insertAnchored` exists for.
+   *
+   * The counter walks **backwards**. `unshift` puts each row at the front, so
+   * feeding a page front-to-back stores it in reverse — which is what a real
+   * feed does if it unshifts each item as it is parsed. It is a silent bug: the
+   * list still grows and still anchors, only the page is upside down. On device
+   * it showed up as `第 81 轮 · 回答 2 / 2` rendered above `回答 1 / 2`.
+   */
+  private prependOneByOne(page: FeedItem[], i: number): void {
+    if (i < 0) {
       this.loadingOlder = false;
-      hilog.info(DOMAIN, TAG, 'loadOlder rounds=%{public}d rows=%{public}d -> total %{public}d',
-        FeedSource.roundsIn(page), page.length, this.items.length);
+      hilog.info(DOMAIN, TAG, 'perRow done rows=%{public}d -> total %{public}d',
+        page.length, this.items.length);
+      return;
+    }
+    setTimeout(() => {
+      this.mutateAnchored(1, () => {
+        this.items.unshift(page[i]);
+      });
+      this.prependOneByOne(page, i - 1);
     }, 0);
   }
 

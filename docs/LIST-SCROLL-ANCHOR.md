@@ -308,6 +308,95 @@ HUD: 首项 17 · 修正 2 次 · 高度变化 241vp
 > 另外 `churnVp` 必须过滤 `before > 0`（组件构造而非行 resize）——
 > 不加这个过滤，一次重建会把 241vp 报成 2128vp。
 
+### 0.3.5 整页插入 vs 逐条 unshift：同样的数据，结果完全不同
+
+一个很自然的疑问：*演示里从上方插入数据，列表一点不跳；可我在真实穿戴设备上跳得厉害，
+是不是因为我一条一条 `unshift`？* —— **是，而且这是主因。**
+
+`InsertMode` 就是这个对照实验（列表页顶部「整页插入 / 逐条 unshift」开关）：
+
+| 插入方式 | 锚定 | 首行 |
+|---|---|---|
+| 整页 `concat` | 开 | 不动（`首项 17`，吸收 241vp） |
+| **逐条 `unshift`** | **关** | **`第 82 轮` → `第 77 轮`，甩回一整页** |
+| 逐条 `unshift` | 开 | 不动（吸收 383vp） |
+
+**「逐条 + 关锚定」就是没有锚定的真实业务**，一页 17-21 行会在几毫秒内进完
+（实测 `setTimeout(fn, 0)` 链：21 行 5ms），每一行都是一次独立的数组变更 + 一次布局，
+读者的位置被推 N 次。整页插入只有一次。
+
+#### 逐条插入踩到的坑（`insertAnchored` 已修）
+
+就算锚定开着，逐条插入在修复前也是错的。原因在 `insertAnchored` 里：
+
+```ts
+// 修复前
+const wasAtTop = this.firstVisible === 0;
+this.keeper.capture(this.firstVisible, wasAtTop);   // ← 每次调用都重新 capture
+```
+
+`firstVisible` 只由 `onScrollIndex` 刷新，而**紧凑的插入循环跑得比滚动事件快**：
+21 行在 5ms 内进完，期间一个滚动事件都没有。于是 `shift()` 已经把锚点索引往前推了，
+`capture()` 又把它按一个**过期的** `firstVisible` 拽回去 —— 每迭代一次落后一行。
+真机日志里能直接看到这个形状：
+
+```
+capture index=0 top-aligned
+begin index=1 savedY=0.0
+begin index=2 savedY=0.0
+begin index=3 savedY=0.0     ← 索引被一行一行推着走
+```
+
+修复：**hold 还活着的时候，锚点以 hold 自己为准，不再 capture。**
+`shift()` 一直跟着每次插入走，`savedY` 是 hold 正在维持的位置；
+`capture()` 是「开始一次 hold」用的，不是「继续一次 hold」用的：
+
+```ts
+if (!this.keeper.isHolding()) {
+  this.keeper.capture(this.firstVisible, this.firstVisible === 0);
+}
+```
+
+修复后同样的 21 行只有**一次** `capture`：
+
+```
+capture index=0 top-aligned
+begin index=1 / 2 / 3 / ... / 21       ← 每次只 shift(+1)
+```
+
+`tools/simulate-anchor.mjs` 里加了对应的回归（数据、延迟、落位时间完全相同，
+**唯一变量是 capture 次数**）：
+
+```
+mode                                          captures  finalErr   worst  maxDrift
+整页 concat  · 一次 insertAnchored(n)                    1       0vp     0vp     295vp
+逐条 unshift · 修复前（每次重新 capture）                      20      93vp    93vp     143vp
+逐条 unshift · 修复后（hold 期间不 capture）                   1       0vp     0vp     295vp
+```
+
+> 另外注意 `unshift` 的方向：把一页**正序**逐条 `unshift` 进去，页面会**倒过来**存。
+> 这个 bug 很安静 —— 列表照样变长、锚定照样生效，只有顺序反了。
+> 真机上表现为 `第 81 轮 · 回答 2 / 2` 渲染在 `回答 1 / 2` **上面**。
+> 演示里因此是**倒序**遍历这一页（见 `prependOneByOne`）。
+
+#### 所以真实设备为什么跳得厉害
+
+按可能性排序，前三条都能单独造成"跳得厉害"：
+
+1. **逐条 unshift 且没有锚定** —— 一次插入一次位移，一页就是 N 次。
+2. **行高不确定**：真实数据没有高度字段，行高靠内容量出来。
+   插入瞬间列表并不知道这一行多高，只能按均值估；等 400-600ms 后内容到位、
+   真实高度出来，列表再把估值改掉 —— **每次修正都是一次跳动**。
+   演示里每行都显式写了 `.height()`，所以列表的几何一开始就是准的。
+   这是"演示不跳、真机跳"最容易被忽略的一条。
+3. **`Repeat.virtualScroll()` 没有 `onGetItemMainSizeByIndex`**（见 §8），
+   所以"提前告诉列表每行多高"在 `Repeat` 下做不到，只能靠行自己声明高度。
+4. 逐条插入时若走了锚定，还要用**修复后**的 `insertAnchored`（见上）。
+
+**建议**：拿到一页之后**攒成一批再改数组**（`items = page.concat(items)`），
+用一次 `insertAnchored(page.length, …)` 包住；确实必须逐条进的时候，
+让每行一开始就占**最终高度**（骨架 = 定高），或者接受行会二次增长。
+
 ---
 
 ## 1. 要解决的问题

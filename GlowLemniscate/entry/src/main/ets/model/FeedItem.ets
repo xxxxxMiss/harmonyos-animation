@@ -74,17 +74,26 @@ export class FeedItem {
   readonly title: string;
   readonly preview: string;
   /** Height once the row has fully rendered. */
-  readonly height: number;
+  readonly finalHeight: number;
   /** Height while the row is still showing its placeholder. Always shorter. */
   readonly skeletonHeight: number;
+  /** Seed for the deterministic latency draw. */
+  readonly seed: number;
   /**
-   * Whether this row's content arrives asynchronously. There is deliberately no
-   * delay constant — how long a real fetch takes is not knowable, so the row
-   * simply starts un-ready and the page resolves it on the next tick.
+   * How many stages this row moves through, chosen by the active latency profile
+   * in `planFor()`. 1 = straight to the final height.
    */
-  readonly deferred: boolean;
-  /** Flipped to true when the content has arrived. Observed by the row. */
-  @Trace ready: boolean;
+  stages: number = 1;
+  /** Whether this row's content arrives asynchronously at all. */
+  readonly async: boolean;
+  /**
+   * The height the row renders at right now. This is the field that makes the
+   * list re-lay out — several times per row under the staged watch profile,
+   * which is what produces a realistic settle storm.
+   */
+  @Trace currentHeight: number;
+  /** Index of the stage reached so far; equals `stages` when settled. */
+  @Trace stage: number;
 
   constructor(round: number, kind: MsgKind, slot: number, answerCount: number) {
     const h: number = hash32(round * 31 + slot * 7);
@@ -100,14 +109,59 @@ export class FeedItem {
       ? '第 ' + round + ' 轮 · 提问'
       : '第 ' + round + ' 轮 · 回答 ' + slot + ' / ' + answerCount;
     // Questions are compact and fairly uniform; answers are the variable ones.
-    this.height = kind === MsgKind.QUESTION ? 92 + (h % 40) : 84 + (h % 120);
+    this.finalHeight = kind === MsgKind.QUESTION ? 92 + (h % 40) : 84 + (h % 120);
     // A placeholder that is visibly shorter than the real row, so the list
     // actually re-lays out when the content lands.
     this.skeletonHeight = 60;
-    // Roughly one row in seven defers, deliberately not consecutive so the rows
-    // settle out of order.
-    this.deferred = h % 7 === 0;
-    this.ready = !this.deferred;
+    // Roughly one row in seven arrives asynchronously, deliberately not
+    // consecutive so the rows settle out of order.
+    this.seed = h;
+    this.async = h % 7 === 0;
+    // Filled in by `planFor()`, which knows the active latency profile.
+    this.currentHeight = this.finalHeight;
+    this.stage = 1;
+  }
+
+  /** Applies the latency plan chosen by the harness. */
+  planFor(stages: number, async: boolean): void {
+    if (stages > 1) {
+      this.stages = stages;
+    }
+    if (async) {
+      // Start as a skeleton and let the harness advance the stages.
+      this.stages = Math.max(this.stages, 1);
+      this.stage = 0;
+      this.currentHeight = this.skeletonHeight;
+    } else {
+      this.stage = this.stages;
+      this.currentHeight = this.finalHeight;
+    }
+  }
+
+  /** True once the row has reached its final height. */
+  get settled(): boolean {
+    return this.stage >= this.stages;
+  }
+
+  /** Moves to stage `s` of `of`, interpolating the height. */
+  advanceTo(s: number, of: number): void {
+    if (s <= this.stage) {
+      return;
+    }
+    this.stage = s;
+    if (s >= of) {
+      this.currentHeight = this.finalHeight;
+    } else {
+      const frac: number = s / of;
+      this.currentHeight =
+        Math.round(this.skeletonHeight + (this.finalHeight - this.skeletonHeight) * frac);
+    }
+  }
+
+  /** Jumps straight to the final height. */
+  settle(): void {
+    this.stage = this.stages;
+    this.currentHeight = this.finalHeight;
   }
 }
 
@@ -131,15 +185,19 @@ export class FeedSource {
   }
 
   /** Every message of one round: the question, then its answers. */
-  static round(round: number): FeedItem[] {
+  static round(round: number, stages: number = 1): FeedItem[] {
     const out: FeedItem[] = [];
     const answers: number = FeedSource.answerCount(round);
     if (answers === 0) {
       return out;
     }
-    out.push(new FeedItem(round, MsgKind.QUESTION, 0, answers));
+    const q: FeedItem = new FeedItem(round, MsgKind.QUESTION, 0, answers);
+    q.planFor(stages, q.async);
+    out.push(q);
     for (let slot = 1; slot <= answers; slot++) {
-      out.push(new FeedItem(round, MsgKind.ANSWER, slot, answers));
+      const a: FeedItem = new FeedItem(round, MsgKind.ANSWER, slot, answers);
+      a.planFor(stages, a.async);
+      out.push(a);
     }
     return out;
   }
@@ -152,12 +210,17 @@ export class FeedSource {
    * That is the whole point: the caller passes `rows.length` to the scroll
    * effect, and the effect has no page size to be wrong about.
    */
-  static pageRounds(fromRound: number, count: number): FeedItem[] {
+  /**
+   * @param stages how many height steps each asynchronous row moves through.
+   *        Supplied by `LatencyHarness` so the demo can be run against a
+   *        realistic watch profile instead of settling on the next tick.
+   */
+  static pageRounds(fromRound: number, count: number, stages: number = 1): FeedItem[] {
     const out: FeedItem[] = [];
     const first: number = Math.max(fromRound, FeedSource.MIN_ROUND);
     const last: number = Math.min(fromRound + count - 1, FeedSource.MAX_ROUND);
     for (let round = first; round <= last; round++) {
-      const msgs: FeedItem[] = FeedSource.round(round);
+      const msgs: FeedItem[] = FeedSource.round(round, stages);
       for (let i = 0; i < msgs.length; i++) {
         out.push(msgs[i]);
       }

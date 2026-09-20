@@ -138,6 +138,103 @@ this.newerRound = fromRound + FeedSource.roundsIn(page);
 
 ---
 
+## 0.3 复杂测试案例：400-900ms 的分段渲染
+
+真机（尤其手表）上，一行从插入到渲染完成可能要 **400-600ms**，而且不是一步到位 ——
+可能先骨架、再半高、最后定高。一页 30 行这样settle，会产生**上百次布局变化**，
+全部在锚定已经复位之后才到达。原来的演示「下一 tick 就就绪」，完全没覆盖这个场景。
+
+`tools/simulate-anchor.mjs` 用真实设备的参数跑了一遍，**复现了失效**：
+
+```
+scenario                                  settle  corrections  layoutEvt  budget   finalErr  worst
+A  baseline — instant settle, 1 stage         0ms           2          9       ok       0vp     0vp
+B  120ms, 1 stage                           139ms           5         35       ok       0vp     0vp
+C  watch 400-600ms, 1 stage                 595ms           9         35       ok       0vp     0vp
+D  watch 400-600ms, 2 stages                595ms          14         70       ok       0vp     0vp
+E  worst 400-900ms, 3 stages, 30 rows       887ms          39        159       ok       0vp     0vp
+```
+
+修复前的同一套场景（保留在 git 历史里）：
+
+```
+B  120ms                       finalErr =  725vp
+C  watch 400-600ms             finalErr = -786vp
+E  400-900ms 3 stages, 30 rows  finalErr =  325vp   ← correction budget exhausted
+```
+
+### 0.3.1 两个真 bug
+
+**（1）修正量被写成了「增量」，但 `align = START` 每次调用都会重新定基。**
+
+`scrollToIndex(..., align = START)` 先把该行顶边对齐到视口顶部，**再**位移 `extraOffset`。
+所以基准每次都重建，`y = k · extra` 对每次调用独立成立，**正确答案是一个常量**：
+
+```
+extra = savedY / k
+```
+
+它和「上方内容长高了多少」完全无关，没有任何需要迭代求解的东西。
+
+旧实现却把它当成围绕某个原点的局部仿射，折叠了一个残差：
+
+```ts
+y0 = y - k * extra;          // 只有在布局没动过时才成立
+extra += (savedY - y0) / k;
+```
+
+`y0` 是**推导**出来的、不是重新测量的。手表上 400-600ms 的延迟意味着每次折叠
+面对的都是一个已经移动过的布局 —— 锚点跑偏几百 vp，而且 `k` 也被带坏：
+
+```
+k re-derived 17 times; final k = -0.150
+  t=416ms  k -1 -> 0.7
+  t=448ms  k -1 -> 2.35
+  t=560ms  k -1 -> 6.375
+  t=576ms  k 6.375 -> -15.663
+```
+
+`k` 是 vp→vp 的单位换算，不可能合理地为 6.4 或 -15.7 —— 它是拿**内容位移**除以**修正位移**算出来的。
+
+修复后的轨迹，`extra` 恒等于 `40 = -savedY`，只靠 `rowTop` 增长推动 offset：
+
+```
+apply t=112  extra=40.0 -> offset=2741  y=-40.0
+apply t=128  extra=40.0 -> offset=2884  y=-40.0
+apply t=144  extra=40.0 -> offset=3480  y=-40.0
+final: offset=3480 rowTop=3440 y=-40.0 target=-40
+```
+
+**（2）`maxCorrections` 把「正常的落位」也算成了预算消耗。**
+
+它现在只在**未收敛**时累加，收敛即归零。一页手表列表能产生 100+ 次高度变化，
+按旧的算法 40 次就耗尽了 —— 这正是「400-600ms 就失灵」的直接原因。
+
+### 0.3.2 另外两处配套改动
+
+- **行只在高度真的变化时才上报**：`onAreaChange((o, n) => ...)` 里比较 `height`。
+  行进出构建窗口也会触发这个回调，而锚定自己的 ALIGN 跳转就会造成大量进出 ——
+  上报它们会把每次位移都标记成「布局动过」，永久堵死 `k` 的标定。
+- **`k` 只在干净窗口内标定**：`cleanWindow` 在 `applyCorrection` 置位、在任何一次
+  高度变化时清零。跨越一次 settle 的测量描述的是布局，不是映射。
+
+### 0.3.3 怎么手工跑这个案例
+
+真机上列表页顶部有一条 profile 切换条：
+
+| 档位 | 含义 |
+|---|---|
+| 即时（下一 tick） | 修复前的演示行为，作为对照 |
+| 手机 ~120ms | 单段 |
+| 手表 400-600ms | 单段 |
+| **手表 400-900ms · 分 3 段** | **最难的一档**，骨架→半高→定高 |
+
+切换会重新播种对话。**所有时间只在 `model/RenderLatency.ets` 里**——
+那是全工程唯一允许 `setTimeout(fn, ms)` 的地方，因为它在模拟流水线，
+而不是让机制去猜一个延迟。`scroll/` 目录下仍然零墙钟等待。
+
+---
+
 ## 1. 要解决的问题
 
 列表里**每一条的高度都不一样**，而且**有些条目渲染很慢**：

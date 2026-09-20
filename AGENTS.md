@@ -46,7 +46,11 @@ export HVIGOR_USER_HOME=$PWD/../.hvigor-home          # 缓存留在工作区内
 
 ```bash
 node tools/verify-geometry.mjs        # 期望输出 PASS，mismatching: 0
+node tools/simulate-anchor.mjs        # 锚定控制流仿真；期望 PASS，finalErr 全为 0vp
 ```
+
+`simulate-anchor.mjs` 不经设备就能验证锚定算法在 120ms / 400-600ms / 400-900ms 分段
+落位下的表现。**改动 `AnchorKeeper` 或 `AnchoredPaging` 后必须跑它。**
 
 真机验证（改了列表/滚动/UI 之后应当跑一遍）：
 
@@ -71,6 +75,9 @@ $HDC shell snapshot_display -f /data/local/tmp/x.jpeg && $HDC file recv /data/lo
   阈值/预算通过 `AnchorOptions` 注入，模块级常量已经清掉。
 - **`pages/ListPage.ets` —— 只是演示宿主**，只该出现业务（行长什么样、数据从哪来、
   一页多少条）。往它里面加滚动逻辑就等于把通用组件又写死回去了。
+- **`model/RenderLatency.ets` —— 模拟渲染延迟，是全工程唯一允许 `setTimeout(fn, ms)`
+  的地方**（见 §3 第 3 条的解释：它模拟的是流水线，不是让机制猜延迟）。
+  演示默认是「即时」，真机测试要切到「手表 400-900ms · 分 3 段」那一档。
 
 判据：**「滚动该怎么反应」属于效果；「数据从哪来、一次要多少」属于宿主。**
 
@@ -86,6 +93,12 @@ $HDC shell snapshot_display -f /data/local/tmp/x.jpeg && $HDC file recv /data/lo
 3. **禁止 `setTimeout(fn, ms)`** —— 只允许 `setTimeout(fn, 0)`，且只用来「跳出布局回调」，
    绝不用来「等某件事完成」。延迟多少才够是无法事先确定的，手机上对的数在手表上就是错的。
    需要等某个状态就绪时，挂到真实事件上（滚动事件 / `onAreaChange`）。
+
+**改锚定算法之前必须先读 `docs/LIST-SCROLL-ANCHOR.md` §0.3。** 那里记着一个很贵的教训：
+`align = START` 每次调用都重新定基，所以修正量是**常量** `savedY / k`；
+把它写成增量（折叠 `y0`）在「下一 tick 就就绪」的演示里看不出问题，
+一到手表 400-600ms 的真实延迟就跑偏几百 vp。`tools/simulate-anchor.mjs` 可以在不接设备的情况下
+复现这类失效——**改算法后先跑它**。
 
 另外两个踩过的坑，改这块之前先看 `docs/LIST-SCROLL-ANCHOR.md` §3.3：
 `getItemRect()` 返回 **vp**（不是 px）；`onReachEnd`/`onAreaChange`/路由页 `aboutToAppear`

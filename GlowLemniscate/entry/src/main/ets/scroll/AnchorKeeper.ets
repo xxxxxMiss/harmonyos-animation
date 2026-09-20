@@ -34,24 +34,34 @@
  * How the correction is derived
  * -----------------------------
  * `scrollToIndex(..., align = START)` places the row's top edge at the viewport
- * top, which is a known base; `extraOffset` then displaces it, giving a locally
- * affine relationship
+ * top, which is a known base; `extraOffset` then displaces it. Because the base
+ * is re-established on **every** call, the relationship is
  *
- *     y(extra) = y0 + k * extra        =>        extra* = (savedY - y0) / k
+ *     y = k * extra        =>        extra* = savedY / k
  *
- * `k` folds in both the sign convention and the unit, and it is *measured*
- * rather than assumed — guessing it wrong on device walked the list away from
- * the target until the row left the built range entirely. `k` starts at -1,
- * which is the value observed when the list is at rest (vp in, vp out, inverted),
- * and is re-derived from every real correction: after applying `extra`, an
- * observed `y` gives `k = (y - y0) / extra`. So an inaccurate starting guess
- * costs one extra pass and then self-corrects.
+ * and that is a **constant**. It does not depend on how far the content above
+ * has grown, and there is nothing to solve iteratively.
  *
- * An earlier revision calibrated with a dedicated probe scroll of `PROBE_VP`.
- * That was removed: the probe is a second, *small* scroll issued immediately
- * after the align jump, and if it does not change the visible range it produces
- * no scroll event to wait on. Deriving `k` from the correction we were going to
- * make anyway needs no extra scroll at all.
+ * `k` folds in both the sign convention and the unit; it starts at -1, the value
+ * measured on device (vp in, vp out, inverted), and is re-derived as `y / extra`
+ * from a displacement whose result can be measured cleanly. A wrong guess costs
+ * one extra pass and then self-corrects.
+ *
+ * What this replaced, and why
+ * ---------------------------
+ * The first revision treated `y` as locally affine around an *interpolated*
+ * origin and folded in a residual:
+ *
+ *     y0 = y - k * extra ;   extra += (savedY - y0') / k
+ *
+ * That is only valid while the layout holds still between the two measurements,
+ * because `y0` is re-derived rather than re-measured. It is not valid on a
+ * watch, where rows settle 400-600 ms after insertion: every fold was computed
+ * against a layout that had already moved. Measured symptoms were an anchor that
+ * walked 600-790 vp away, and a `k` poisoned from -1 to 6.4 and -15.7 by
+ * dividing a content shift by the displacement.
+ *
+ * `tools/simulate-anchor.mjs` reproduces both the old failure and the fix.
  *
  * No wall-clock waits, and no polling
  * -----------------------------------
@@ -107,15 +117,13 @@ const TAG: string = 'AnchorKeeper';
  * Where each one sits in one hold:
  *
  *     ALIGN   scrollToIndex(index, START, 0)     // brings the row into view
- *     SOLVE   y0 = getItemRect(index).y          // <-- stallLimit guards this
- *             extra = (savedY - y0) / k
- *             scrollToIndex(index, START, extra)
+ *     CORRECT scrollToIndex(index, START, savedY / k)   // <- stallLimit guards this
  *     VERIFY  err = getItemRect(index).y - savedY
  *             |err| <= toleranceVp ? done        // <-- toleranceVp guards this
- *             else refine k and correct again    // <-- maxCorrections guards this
+ *             else re-derive k and re-apply      // <-- maxCorrections guards this
  *
- * A normal hold is 2 corrections, which is the number all the defaults are
- * sized against.
+ * A quiet hold is 2 corrections. `maxCorrections` is sized for a settle storm
+ * instead, because it guards only attempts that did *not* converge.
  */
 export interface AnchorOptions {
   /**
@@ -153,16 +161,22 @@ export interface AnchorOptions {
    */
   stallLimit?: number;
   /**
-   * Hard cap on corrections for ONE hold — reset in `begin()`.
+   * Hard cap on corrections made **without converging**.
+   *
+   * The counter is reset in `begin()` and again on every convergence, so it
+   * measures attempts that are not making progress — not total activity. That
+   * distinction matters on a watch: one page of late-settling rows can produce
+   * well over a hundred height changes, and counting those as budget exhausted
+   * the guard mid-load and released the hold, which is exactly the "it stops
+   * working at 400-600 ms" symptom.
    *
    * Deliberately separate from the cumulative `restores` counter used for
-   * diagnostics. Using the cumulative value here was a real bug: once a session
-   * accumulated this many corrections the guard stayed tripped forever and
-   * anchoring silently died, with nothing obviously wrong in the log.
+   * diagnostics. Using the cumulative value here was an earlier bug: once a
+   * session accumulated this many corrections the guard stayed tripped forever
+   * and anchoring silently died, with nothing obviously wrong in the log.
    *
-   * Sized against a normal hold of 2. It exists for rows that resize on every
-   * layout pass (an animated placeholder, a self-referential height) or for a
-   * `savedY` that is simply unreachable — without it the effect would issue
+   * It exists for a genuinely stuck loop — a row that resizes on *every* layout
+   * pass, or a `savedY` that is unreachable. Without it the effect would issue
    * `scrollToIndex` on every event-loop turn forever, burning CPU *and* fighting
    * the user, who would be unable to scroll away.
    *
@@ -180,13 +194,13 @@ export function defaultAnchorOptions(): Required<AnchorOptions> {
   };
 }
 
-/** Phases of one solve. See `step()`. */
+/** Phases of one hold. See `step()`. */
 enum Phase {
-  /** Displace by zero to establish the `align = START` base. */
+  /** Bring the anchored row into view; this also builds it. */
   ALIGN = 0,
-  /** Read `y0`, then apply the exact correction. */
-  SOLVE = 1,
-  /** Verify, refine `k` from the result, and correct any residual. */
+  /** Apply the one exact displacement the alignment implies. */
+  CORRECT = 1,
+  /** Measure, and re-derive `k` if the mapping turned out to be wrong. */
   VERIFY = 2
 }
 
@@ -213,8 +227,6 @@ export class AnchorKeeper {
    * list at rest and is refined from every correction actually applied.
    */
   private k: number = -1;
-  /** Row position when `extra == 0`, from the ALIGN phase. */
-  private y0: number = 0;
   private phase: Phase = Phase.ALIGN;
   private extra: number = 0;
 
@@ -238,6 +250,14 @@ export class AnchorKeeper {
    * as the budget meant the guard tripped once and stayed tripped forever.
    */
   private corrections: number = 0;
+  /** Corrections issued for the current hold, for logging. */
+  private holdTotal: number = 0;
+  /**
+   * True while the last displacement can still be measured cleanly — set when a
+   * correction is applied, cleared the moment a row resizes. `y / extra` only
+   * describes the vp-to-vp mapping if the layout held still across the two.
+   */
+  private cleanWindow: boolean = true;
   /**
    * Set after a `scrollToIndex` and cleared when the framework reports the
    * scroll. While set, the keeper will not re-measure, because a measurement
@@ -344,6 +364,8 @@ export class AnchorKeeper {
     this.phase = Phase.ALIGN;
     this.stalls = 0;
     this.corrections = 0;
+    this.holdTotal = 0;
+    this.cleanWindow = false;
     this.awaitingScroll = false;
     this.active = true;
     this.dirty = true;
@@ -361,6 +383,9 @@ export class AnchorKeeper {
       return;
     }
     this.dirty = true;
+    // A row resized, so everything below it shifted. Any slope derived across
+    // this point describes the layout rather than the correction.
+    this.cleanWindow = false;
     // Rows appearing or resizing is independent proof that the pending scroll
     // has been applied, so it also releases the wait.
     this.awaitingScroll = false;
@@ -416,7 +441,9 @@ export class AnchorKeeper {
     }
 
     if (this.phase === Phase.ALIGN) {
-      this.phase = Phase.SOLVE;
+      // Bring the row into view. This also builds it, which is what makes the
+      // verification measurement below possible at all.
+      this.phase = Phase.CORRECT;
       this.applyCorrection(0);
       return;
     }
@@ -436,39 +463,62 @@ export class AnchorKeeper {
     }
     this.stalls = 0;
 
-    if (this.phase === Phase.SOLVE) {
-      this.y0 = rect.y;
+    if (this.phase === Phase.CORRECT) {
+      // ------------------------------------------------------------------
+      // THE WHOLE CORRECTION, and it is a constant.
+      //
+      // `scrollToIndex(..., align = START)` re-bases on every call: it puts the
+      // row's top edge at the viewport top and *then* displaces by
+      // `extraOffset`. So `y == k * extra` holds for each call independently of
+      // what came before, and the displacement that lands on `savedY` is simply
+      //
+      //     extra = savedY / k
+      //
+      // It does NOT depend on how far the content above has grown, and there is
+      // nothing to solve iteratively.
+      //
+      // The first revision instead folded in a residual measured against `y0`:
+      // `extra += (savedY - y) / k`. That is only valid while the layout holds
+      // still, because `y0` is re-derived rather than re-measured. On a watch,
+      // where rows settle 400-600 ms late, every such fold was computed against
+      // a layout that had already moved — the anchor walked off by hundreds of
+      // vp, and the derived `k` was poisoned into the bargain (observed:
+      // -1 -> 0.7 -> 2.35 -> 6.375 -> -15.663).
+      // ------------------------------------------------------------------
+      this.extra = this.savedY / this.k;
       this.phase = Phase.VERIFY;
-      this.extra = (this.savedY - this.y0) / this.k;
-      hilog.info(DOMAIN, TAG, 'solve y0=%{public}s k=%{public}s -> extra=%{public}s',
-        this.y0.toFixed(1), this.k.toFixed(4), this.extra.toFixed(1));
+      hilog.info(DOMAIN, TAG, 'correct savedY=%{public}s k=%{public}s -> extra=%{public}s',
+        this.savedY.toFixed(1), this.k.toFixed(4), this.extra.toFixed(1));
       this.applyCorrection(this.extra);
       return;
     }
 
-    // ---- VERIFY: measure, refine `k` from what actually happened ----------
+    // ---- VERIFY ---------------------------------------------------------
     const err: number = rect.y - this.savedY;
     if (Math.abs(err) <= this.opts.toleranceVp) {
       hilog.info(DOMAIN, TAG, 'converged y=%{public}s target=%{public}s k=%{public}s after %{public}d',
-        rect.y.toFixed(1), this.savedY.toFixed(1), this.k.toFixed(4), this.corrections);
+        rect.y.toFixed(1), this.savedY.toFixed(1), this.k.toFixed(4), this.holdTotal);
       this.dirty = false;
+      // The guard counts attempts that did NOT converge. Resetting here is what
+      // keeps a long but productive settle storm from tripping it — on a watch a
+      // single page can produce well over a hundred height changes.
+      this.corrections = 0;
       this.onSettled();
       return;
     }
-    // `y = y0 + k * extra`, and we have all three, so the slope can be measured
-    // from the correction just applied instead of from a dedicated probe scroll.
-    if (Math.abs(this.extra) > 1) {
-      const measured: number = (rect.y - this.y0) / this.extra;
+
+    // Still off, so `k` itself is wrong. Re-derive it from this measurement —
+    // but only if nothing resized since the displacement was applied, otherwise
+    // `y / extra` describes the layout rather than the mapping.
+    if (this.cleanWindow && Math.abs(this.extra) > 1) {
+      const measured: number = rect.y / this.extra;
       if (Math.abs(measured) > 0.05 && Math.abs(measured - this.k) > 0.001) {
         hilog.info(DOMAIN, TAG, 'refine k %{public}s -> %{public}s',
           this.k.toFixed(4), measured.toFixed(4));
         this.k = measured;
       }
     }
-    this.y0 = rect.y - this.k * this.extra;
-    this.extra = (this.savedY - this.y0) / this.k;
-    hilog.info(DOMAIN, TAG, 'residual err=%{public}s -> extra=%{public}s',
-      err.toFixed(1), this.extra.toFixed(1));
+    this.extra = this.savedY / this.k;
     this.applyCorrection(this.extra);
   }
 
@@ -490,6 +540,9 @@ export class AnchorKeeper {
       { extraOffset: LengthMetrics.vp(value) });
     this.restores++;
     this.corrections++;
+    this.holdTotal++;
+    // The measurement that follows is clean unless something resizes first.
+    this.cleanWindow = true;
     // Do NOT re-arm here. The next step waits for the framework to report the
     // scroll, either through `onScrollSettled()` (List scroll events) or through
     // `notifyLayoutChanged()` (rows built or resized by the scroll). Arming

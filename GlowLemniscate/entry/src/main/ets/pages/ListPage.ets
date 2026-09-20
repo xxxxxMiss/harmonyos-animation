@@ -38,6 +38,7 @@
 
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { FeedItem, FeedSource, MsgKind } from '../model/FeedItem';
+import { LatencyHarness, LatencyProfile } from '../model/RenderLatency';
 import { AnchoredPaging, PULL_IDLE } from '../scroll/AnchoredPaging';
 
 /**
@@ -61,19 +62,17 @@ const TAG: string = 'ListPage';
 @ComponentV2
 struct FeedRow {
   @Require @Param item: FeedItem;
+  /** Which latency profile to simulate when this row first appears. */
+  @Require @Param profile: LatencyProfile;
   /** Bubbles the row's size change up to the scroll effect. */
   @Event onSized: () => void = () => {
   };
 
   aboutToAppear(): void {
-    if (!this.item.ready) {
-      // Stands in for an asynchronous data source. A real one would resolve a
-      // promise here; there is deliberately no delay constant, because the right
-      // number is unknowable and device dependent. `setTimeout(fn, 0)` only moves
-      // the state write out of the current layout pass — it is not a wait.
-      setTimeout(() => {
-        this.item.ready = true;
-      }, 0);
+    if (!this.item.settled) {
+      // The timing lives entirely in `LatencyHarness`; see the note there about
+      // why that module, and only that module, is allowed wall-clock delays.
+      LatencyHarness.schedule(this.item, this.profile);
     }
   }
 
@@ -92,7 +91,7 @@ struct FeedRow {
       this.accent()
 
       Column({ space: 6 }) {
-        if (this.item.ready) {
+        if (this.item.settled) {
           Row() {
             Text(this.item.kind === MsgKind.QUESTION
               ? ('第 ' + this.item.round + ' 轮 · 提问')
@@ -145,17 +144,25 @@ struct FeedRow {
       .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
-    .height(this.item.ready ? this.item.height : this.item.skeletonHeight)
+    .height(this.item.currentHeight)
     .padding({ left: 12, right: 16, top: 12, bottom: 12 })
     // Answers are inset so a round reads as one visual block.
     .margin({ left: this.item.kind === MsgKind.QUESTION ? 0 : 20 })
-    .backgroundColor(this.item.ready
+    .backgroundColor(this.item.settled
       ? (this.item.kind === MsgKind.QUESTION ? '#1A1A28' : '#14141C')
       : '#0E0E14')
     .borderRadius(12)
-    .onAreaChange((_oldValue: Area, _newValue: Area) => {
-      // Fires both when a row first appears and when its height changes.
-      this.onSized();
+    .onAreaChange((oldValue: Area, newValue: Area) => {
+      // Only a HEIGHT change moves anything below this row, and only that is
+      // worth waking the anchor for.
+      //
+      // `onAreaChange` also fires when a row enters or leaves the built window
+      // during a scroll — which the anchor's own align jump causes. Reporting
+      // those would mark every displacement as "the layout moved" and
+      // permanently block the effect from calibrating its unit mapping.
+      if (Number(oldValue.height) !== Number(newValue.height)) {
+        this.onSized();
+      }
     })
   }
 }
@@ -168,9 +175,18 @@ struct ListPage {
    * inside the routed page's first render pass, and ArkUI rejects state writes
    * there ("State variable ... has changed during render").
    */
-  @Local items: FeedItem[] = FeedSource.pageRounds(FeedSource.START_ROUND, ROUNDS_PER_PAGE);
+  @Local items: FeedItem[] = FeedSource.pageRounds(
+    FeedSource.START_ROUND, ROUNDS_PER_PAGE, LatencyHarness.stages(LatencyProfile.INSTANT));
+  /**
+   * Which render-latency profile the demo simulates. Switch it to run the same
+   * code against a realistic watch settle storm — see `LatencyHarness`.
+   * Changing it re-seeds the conversation.
+   */
+  @Local profile: LatencyProfile = LatencyProfile.INSTANT;
   /** Display only: how many rounds the current rows span. */
   @Local roundsShown: number = ROUNDS_PER_PAGE;
+  /** Bumped on every re-seed so `Repeat` rebuilds rows with the new plan. */
+  @Local generation: number = 0;
   @Local loadingNewer: boolean = false;
   @Local loadingOlder: boolean = false;
   /**
@@ -231,6 +247,40 @@ struct ListPage {
     this.paging.release();
   }
 
+  /** Re-seeds the conversation under a new latency profile. */
+  private reseed(profile: LatencyProfile): void {
+    this.profile = profile;
+    this.generation++;
+    const stages: number = LatencyHarness.stages(profile);
+    this.items = FeedSource.pageRounds(FeedSource.START_ROUND, ROUNDS_PER_PAGE, stages);
+    this.roundsShown = ROUNDS_PER_PAGE;
+    this.olderRound = FeedSource.START_ROUND - 1;
+    this.newerRound = FeedSource.START_ROUND + ROUNDS_PER_PAGE;
+    this.paging.release();
+    hilog.info(DOMAIN, TAG, 'reseed profile=%{public}s stages=%{public}d rows=%{public}d',
+      LatencyHarness.label(profile), stages, this.items.length);
+  }
+
+  @Builder
+  profileBar() {
+    Row({ space: 6 }) {
+      ForEach([LatencyProfile.INSTANT, LatencyProfile.FAST,
+        LatencyProfile.WATCH, LatencyProfile.WATCH_STAGED], (p: LatencyProfile) => {
+        Text(LatencyHarness.label(p))
+          .fontSize(10)
+          .fontColor(this.profile === p ? '#0B0B12' : '#8A8AA8')
+          .backgroundColor(this.profile === p ? '#6C7BFF' : '#1A1A28')
+          .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+          .borderRadius(6)
+          .onClick(() => {
+            this.reseed(p);
+          })
+      }, (p: LatencyProfile) => String(p))
+    }
+    .width('100%')
+    .padding({ left: 12, right: 12, bottom: 6 })
+  }
+
   // ---------------------------------------------------------------------------
   // Business logic. None of this is known to the scroll effect.
   // ---------------------------------------------------------------------------
@@ -251,7 +301,8 @@ struct ListPage {
     // `setTimeout(fn, 0)` is only here to leave the layout pass that raised the
     // scroll event before touching state. It is not a simulated latency.
     setTimeout(() => {
-      const page: FeedItem[] = FeedSource.pageRounds(fromRound, ROUNDS_PER_PAGE);
+      const page: FeedItem[] = FeedSource.pageRounds(fromRound, ROUNDS_PER_PAGE,
+        LatencyHarness.stages(this.profile));
       // 0 rows were inserted above the anchor — this is an append.
       this.paging.insertAnchored(0, () => {
         this.items = this.items.concat(page);
@@ -275,7 +326,8 @@ struct ListPage {
       this.olderRound - ROUNDS_PER_PAGE + 1);
 
     setTimeout(() => {
-      const page: FeedItem[] = FeedSource.pageRounds(fromRound, this.olderRound - fromRound + 1);
+      const page: FeedItem[] = FeedSource.pageRounds(fromRound, this.olderRound - fromRound + 1,
+        LatencyHarness.stages(this.profile));
       // `page.length`, not a constant: the anchor shifts by exactly the number
       // of rows that were inserted above it.
       this.paging.insertAnchored(page.length, () => {
@@ -368,6 +420,7 @@ struct ListPage {
         .width('100%')
         .padding({ left: 16, right: 16, bottom: 6 })
 
+      this.profileBar()
       this.pullStrip()
 
       List({ space: 10, scroller: this.scroller }) {
@@ -376,13 +429,14 @@ struct ListPage {
             ListItem() {
               FeedRow({
                 item: ri.item,
+                profile: this.profile,
                 onSized: () => {
                   this.paging.handleRowResized();
                 }
               })
             }
           })
-          .key((item: FeedItem) => item.id)
+          .key((item: FeedItem) => this.generation + '/' + item.id)
           .virtualScroll({ totalCount: this.items.length })
       }
       .width('100%')
